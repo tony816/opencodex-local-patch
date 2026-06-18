@@ -266,13 +266,25 @@ export function parseRequest(body: unknown): OcxParsedRequest {
 
       if (effectiveType === "tool_search_output") {
         // Pair the tool_search call with its result so the model sees what was loaded.
-        const out = item as { call_id?: string; tools?: { name?: string }[] };
-        if (Array.isArray(out.tools)) loadedToolSpecs.push(...out.tools);
-        const names = Array.isArray(out.tools) ? out.tools.map(t => t?.name).filter((n): n is string => !!n) : [];
+        const out = item as { call_id?: string; tools?: unknown[] };
+        const specs = Array.isArray(out.tools) ? (out.tools as Record<string, unknown>[]) : [];
+        loadedToolSpecs.push(...specs);
+        // List the EXACT wire names the model must call (flattened for namespaced specs), matching
+        // how buildTools exposes them — otherwise the model guesses wrong names (e.g. the bare namespace).
+        const wireNames: string[] = [];
+        for (const spec of specs) {
+          if (spec.type === "namespace" && Array.isArray(spec.tools)) {
+            for (const inner of spec.tools as Record<string, unknown>[]) {
+              if (typeof inner.name === "string") wireNames.push(namespacedToolName(spec.name as string, inner.name));
+            }
+          } else if (typeof spec.name === "string") {
+            wireNames.push(spec.name);
+          }
+        }
         messages.push({
           role: "toolResult", toolCallId: out.call_id ?? "", toolName: "tool_search",
-          content: names.length
-            ? `Tool search loaded ${names.length} tool(s): ${names.join(", ")}. They are now in your available tools — call the appropriate one directly.`
+          content: wireNames.length
+            ? `Tool search loaded these tools — they are now in your available tools. Call one by its EXACT name: ${wireNames.join(", ")}.`
             : "Tool search returned no tools.",
           isError: false, timestamp: now,
         });

@@ -68,6 +68,20 @@ export function loadCatalogTemplate(): RawEntry | null {
   return native ? JSON.parse(JSON.stringify(native)) : null;
 }
 
+/**
+ * The full reasoning ladder advertised for routed models in Codex's picker:
+ * low → medium → high → xhigh → max. (Codex's native catalog tops out at `xhigh`; `max` is added
+ * for providers/adapters that support a higher tier — e.g. the Anthropic adapter maps it to the
+ * largest thinking budget. Previously routed models were clamped to low/medium/high.)
+ */
+const ROUTED_REASONING_LEVELS: { effort: string; description: string }[] = [
+  { effort: "low", description: "Fast responses with lighter reasoning" },
+  { effort: "medium", description: "Balances speed and reasoning depth" },
+  { effort: "high", description: "Greater reasoning depth for complex problems" },
+  { effort: "xhigh", description: "Extended reasoning for the hardest problems" },
+  { effort: "max", description: "Maximum reasoning effort" },
+];
+
 function deriveEntry(template: RawEntry | null, slug: string, desc: string, priority: number): RawEntry {
   if (template) {
     const e = JSON.parse(JSON.stringify(template)) as RawEntry;
@@ -79,7 +93,7 @@ function deriveEntry(template: RawEntry | null, slug: string, desc: string, prio
     if ("upgrade" in e) e.upgrade = null;
     delete e.availability_nux; // don't replay another model's "now available" NUX
     // Routed (namespaced) models inherit the gpt template — correct its OpenAI/GPT identity
-    // and cap reasoning to what the upstream actually accepts (low|medium|high).
+    // and advertise the full reasoning ladder (low/medium/high/xhigh/max).
     if (slug.includes("/")) {
       const modelName = slug.slice(slug.indexOf("/") + 1);
       if (typeof e.base_instructions === "string") {
@@ -88,11 +102,12 @@ function deriveEntry(template: RawEntry | null, slug: string, desc: string, prio
           `You are a coding agent powered by the ${modelName} model, served through the opencodex proxy. Do not claim to be GPT-5 or made by OpenAI.`,
         );
       }
-      if (Array.isArray(e.supported_reasoning_levels)) {
-        e.supported_reasoning_levels = e.supported_reasoning_levels.filter(
-          (l: { effort?: string }) => l.effort === "low" || l.effort === "medium" || l.effort === "high",
-        );
-      }
+      // Reuse the template's level objects where they exist (correct shape/fields), synthesize the rest.
+      const byEffort = new Map(
+        (Array.isArray(e.supported_reasoning_levels) ? e.supported_reasoning_levels : [])
+          .map((l: { effort?: string }) => [l.effort, l]),
+      );
+      e.supported_reasoning_levels = ROUTED_REASONING_LEVELS.map(l => byEffort.get(l.effort) ?? { ...l });
       e.default_reasoning_level = "medium";
     }
     return e;
@@ -101,11 +116,7 @@ function deriveEntry(template: RawEntry | null, slug: string, desc: string, prio
   return {
     slug, display_name: slug, description: desc,
     default_reasoning_level: "medium",
-    supported_reasoning_levels: [
-      { effort: "low", description: "Fast responses with lighter reasoning" },
-      { effort: "medium", description: "Balances speed and reasoning depth" },
-      { effort: "high", description: "Greater reasoning depth for complex problems" },
-    ],
+    supported_reasoning_levels: ROUTED_REASONING_LEVELS.map(l => ({ ...l })),
     shell_type: "shell_command", visibility: "list", supported_in_api: true,
     priority, base_instructions: "You are a helpful coding assistant.",
   };

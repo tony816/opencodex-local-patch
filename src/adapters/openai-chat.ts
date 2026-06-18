@@ -119,11 +119,10 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       // Some models reject a reasoning/thinking param entirely (e.g. xAI grok-build-0.1,
       // grok-composer-2.5-fast). Drop reasoning_effort for them even if Codex selected an effort.
       if (parsed.options.reasoning !== undefined && !provider.noReasoningModels?.includes(parsed.modelId)) {
-        // Many OpenAI-compatible providers (e.g. opencode zen / Xiaomi MiMo) only accept
-        // low|medium|high. Clamp Codex's extra tiers so they don't 400 the upstream.
+        // Forward the full reasoning ladder (low/medium/high/xhigh/max) as-is. Only "minimal"
+        // (Codex-native lowest, widely unsupported downstream) is mapped down to "low".
         const r = parsed.options.reasoning;
-        body.reasoning_effort = (r === "low" || r === "medium" || r === "high")
-          ? r : (r === "minimal" ? "low" : "high");
+        body.reasoning_effort = r === "minimal" ? "low" : r;
       }
       if (parsed.options.presencePenalty !== undefined) body.presence_penalty = parsed.options.presencePenalty;
       if (parsed.options.frequencyPenalty !== undefined) body.frequency_penalty = parsed.options.frequencyPenalty;

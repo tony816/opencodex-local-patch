@@ -59,6 +59,15 @@ export function bridgeToResponsesSSE(
 
       const closeCurrentMessage = () => {
         if (!currentMsg) return;
+        // Finalize the text part (Responses protocol). Without these .done events Codex never
+        // commits the content part and renders the message as truncated / cut off.
+        emit("response.output_text.done", {
+          item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0, text: currentMsg.text,
+        });
+        emit("response.content_part.done", {
+          item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0,
+          part: { type: "output_text", text: currentMsg.text, annotations: [] },
+        });
         const item = {
           type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
           content: [{ type: "output_text", text: currentMsg.text, annotations: [] }],
@@ -71,6 +80,13 @@ export function bridgeToResponsesSSE(
 
       const closeCurrentReasoning = () => {
         if (!currentReasoning) return;
+        emit("response.reasoning_summary_text.done", {
+          item_id: currentReasoning.itemId, output_index: currentReasoning.outputIndex, summary_index: 0, text: currentReasoning.text,
+        });
+        emit("response.reasoning_summary_part.done", {
+          item_id: currentReasoning.itemId, output_index: currentReasoning.outputIndex, summary_index: 0,
+          part: { type: "summary_text", text: currentReasoning.text },
+        });
         const item = {
           type: "reasoning", id: currentReasoning.itemId,
           summary: [{ type: "summary_text", text: currentReasoning.text }],
@@ -83,6 +99,12 @@ export function bridgeToResponsesSSE(
 
       const closeCurrentToolCall = () => {
         if (!currentToolCall) return;
+        // Finalize streamed function-call arguments so Codex commits the call (incl. MCP / computer_use).
+        if (!currentToolCall.freeform && !currentToolCall.toolSearch) {
+          emit("response.function_call_arguments.done", {
+            item_id: currentToolCall.itemId, output_index: currentToolCall.outputIndex, arguments: currentToolCall.args,
+          });
+        }
         const item = currentToolCall.toolSearch
           ? {
               type: "tool_search_call", id: currentToolCall.itemId,

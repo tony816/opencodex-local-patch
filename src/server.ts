@@ -6,7 +6,7 @@ import { createGoogleAdapter } from "./adapters/google";
 import { createOpenAIChatAdapter } from "./adapters/openai-chat";
 import { createResponsesPassthroughAdapter } from "./adapters/openai-responses";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
-import { loadConfig } from "./config";
+import { DEFAULT_SUBAGENT_MODELS, loadConfig, saveConfig } from "./config";
 import { parseRequest } from "./responses/parser";
 import { routeModel } from "./router";
 import { namespacedToolName } from "./types";
@@ -433,6 +433,12 @@ export function startServer(port?: number) {
   // Refresh OAuth provider presets (models/noReasoningModels) from the registry so a proxy update
   // adding/dropping models reaches existing configs on start — not just fresh installs.
   reconcileOAuthProviders(config);
+  // Seed default featured subagent models on first run only (UNSET → defaults). A user-set list,
+  // even [], is left alone so GUI removals persist.
+  if (config.subagentModels === undefined) {
+    config.subagentModels = [...DEFAULT_SUBAGENT_MODELS];
+    saveConfig(config);
+  }
   const listenPort = port ?? config.port ?? 10100;
 
   const server = Bun.serve({
@@ -455,7 +461,8 @@ export function startServer(port?: number) {
 
       if (url.pathname === "/v1/models" && req.method === "GET") {
         const goModels = await fetchAllModels(config);
-        const { buildCatalogEntries, loadCatalogTemplate, NATIVE_OPENAI_MODELS, orderForSubagents } = await import("./codex-catalog");
+        const { buildCatalogEntries, loadCatalogTemplate, nativeOpenAiSlugs, orderForSubagents } = await import("./codex-catalog");
+        const nativeSlugs = nativeOpenAiSlugs();
         const disabledSet = new Set(config.disabledModels ?? []);
         const goEnabled = goModels.filter(m => !disabledSet.has(`${m.provider}/${m.id}`));
         const goOrdered = orderForSubagents(goEnabled, config.subagentModels);
@@ -463,11 +470,11 @@ export function startServer(port?: number) {
           // Codex client → Codex catalog shape: native gpt + namespaced routed models,
           // cloned from a native template so required fields (base_instructions, etc.) are present.
           // Pass the subagent picks so featured models lead by priority (matches the on-disk file).
-          return jsonResponse({ models: buildCatalogEntries(loadCatalogTemplate(), NATIVE_OPENAI_MODELS, goOrdered, config.subagentModels) });
+          return jsonResponse({ models: buildCatalogEntries(loadCatalogTemplate(), nativeSlugs, goOrdered, config.subagentModels) });
         }
         // OpenAI list shape: native gpt bare + routed models namespaced "<provider>/<id>"
         const data = [
-          ...NATIVE_OPENAI_MODELS.map(id => ({ id, object: "model", created: 0, owned_by: "openai" })),
+          ...nativeSlugs.map(id => ({ id, object: "model", created: 0, owned_by: "openai" })),
           ...goOrdered.map(m => ({ id: `${m.provider}/${m.id}`, object: "model", created: 0, owned_by: m.owned_by ?? m.provider })),
         ];
         return jsonResponse({ object: "list", data });

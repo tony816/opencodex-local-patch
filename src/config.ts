@@ -17,6 +17,15 @@ const OCX_DIR = join(homedir(), ".opencodex");
 const CONFIG_PATH = join(OCX_DIR, "config.json");
 const PID_PATH = join(OCX_DIR, "ocx.pid");
 
+/**
+ * Default featured subagent models (native GPT) seeded on a fresh install and when `subagentModels`
+ * is unset. Codex's spawn_agent advertises the first 5 featured catalog entries; these are the GPT
+ * natives the installed Codex actually ships. The user can remove any in the GUI — once they set the
+ * list (even to []), it is respected, so removals persist (start-up only seeds the UNSET case).
+ * Kept to ids ChatGPT accepts; the start-up seed prefers the live catalog's native slugs.
+ */
+export const DEFAULT_SUBAGENT_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+
 export function getConfigDir(): string {
   return OCX_DIR;
 }
@@ -62,6 +71,7 @@ export function getDefaultConfig(): OcxConfig {
       },
     },
     defaultProvider: "openai",
+    subagentModels: [...DEFAULT_SUBAGENT_MODELS],
   };
 }
 

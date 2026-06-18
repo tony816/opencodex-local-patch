@@ -12,12 +12,25 @@ const OCX_DIR = join(homedir(), ".opencodex");
 const CATALOG_BACKUP_PATH = join(OCX_DIR, "catalog-backup.json");
 
 /**
- * Native OpenAI / Codex models served via ChatGPT OAuth passthrough.
- * The ChatGPT backend has no `GET /models`, so these are listed statically.
+ * Native OpenAI / Codex models served via ChatGPT OAuth passthrough — FALLBACK only. The ChatGPT
+ * backend has no `GET /models`, so the real set is read from the live Codex catalog (the slugs Codex
+ * itself ships for the installed version) via nativeOpenAiSlugs(); this static list is used only when
+ * no catalog is present. Keep it to ids ChatGPT actually accepts — advertising a phantom (e.g. an
+ * old `gpt-5.2`/`gpt-5.3-codex` that a newer Codex dropped) makes it 400 "model is not supported".
  */
 export const NATIVE_OPENAI_MODELS = [
-  "gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.3-codex", "gpt-5.3-codex-spark",
+  "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
 ];
+
+/**
+ * The native (passthrough) OpenAI slugs to advertise — the LIVE Codex catalog's own bare slugs when
+ * available (always-latest: matches exactly what the installed Codex supports), else the static
+ * fallback above. Single source for the /v1/models native list and the subagent-default seed.
+ */
+export function nativeOpenAiSlugs(): string[] {
+  const live = listCatalogNativeSlugs();
+  return live.length > 0 ? live : NATIVE_OPENAI_MODELS;
+}
 
 export interface CatalogModel { id: string; provider: string; owned_by?: string; }
 type RawEntry = Record<string, unknown>;

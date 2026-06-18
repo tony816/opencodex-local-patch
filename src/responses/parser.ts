@@ -1,5 +1,6 @@
 import type {
   OcxAssistantMessage,
+  OcxContentPart,
   OcxContext,
   OcxMessage,
   OcxParsedRequest,
@@ -20,26 +21,34 @@ function isObj(v: unknown): v is Record<string, unknown> {
 type InputBlock =
   | { type: "input_text"; text: string }
   | { type: "text"; text: string }
-  | { type: "input_image"; image_url?: string; file_id?: string }
+  | { type: "input_image"; image_url?: string; file_id?: string; detail?: string }
   | { type: "input_file"; file_id?: string; filename?: string };
 
-function inputContentParts(blocks: unknown[] | string | undefined): string | OcxTextContent[] {
+function inputContentParts(blocks: unknown[] | string | undefined): string | OcxContentPart[] {
   if (typeof blocks === "string") return blocks;
   if (!blocks) return [];
-  const parts: OcxTextContent[] = [];
+  const parts: OcxContentPart[] = [];
   for (const raw of blocks) {
     const block = raw as InputBlock;
     if (block.type === "input_text" || block.type === "text") {
       parts.push({ type: "text", text: (block as { text: string }).text });
     } else if (block.type === "input_image") {
-      const ref = (block as { image_url?: string; file_id?: string }).image_url ?? (block as { file_id?: string }).file_id ?? "?";
-      parts.push({ type: "text", text: `[image: ${ref}]` });
+      const b = block as { image_url?: string; file_id?: string; detail?: string };
+      if (b.image_url) {
+        // Preserve the image as a structured part — adapters send it as a native image block.
+        // NEVER inline the (often base64 data-URL) image_url as text: that explodes the token count.
+        parts.push({ type: "image", imageUrl: b.image_url, ...(b.detail ? { detail: b.detail } : {}) });
+      } else {
+        parts.push({ type: "text", text: `[image: ${b.file_id ?? "?"}]` }); // file_id ref → no inline data
+      }
     } else if (block.type === "input_file") {
       const ref = (block as { file_id?: string; filename?: string }).file_id ?? (block as { filename?: string }).filename ?? "?";
       parts.push({ type: "text", text: `[file: ${ref}]` });
     }
   }
-  return parts.length === 1 ? parts[0].text : parts;
+  // Collapse to a plain string only for a single TEXT part; images must stay structured.
+  if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
+  return parts;
 }
 
 type OutputBlock = { type: "output_text"; text: string } | { type: "text"; text: string } | { type: "refusal"; refusal: string };
@@ -190,7 +199,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         switch (msg.role) {
           case "system": {
             const text = inputContentParts(msg.content as unknown[] | string | undefined);
-            const flat = typeof text === "string" ? text : text.map(p => p.text).join("");
+            const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
             if (flat.length > 0) systemPrompt.push(flat);
             break;
           }

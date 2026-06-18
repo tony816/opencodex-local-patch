@@ -2,6 +2,7 @@ import type { ProviderAdapter } from "./base";
 import type {
   AdapterEvent,
   OcxAssistantMessage,
+  OcxContentPart,
   OcxMessage,
   OcxParsedRequest,
   OcxProviderConfig,
@@ -10,6 +11,18 @@ import type {
   OcxToolCall,
 } from "../types";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION, applyClaudeToolPrefix, stripClaudeToolPrefix } from "../oauth/anthropic";
+import { parseDataUrl } from "./image";
+
+/** Map a user content part to an Anthropic content block (text or image source). */
+function toAnthropicContentPart(p: OcxContentPart): unknown {
+  if (p.type === "image") {
+    const data = parseDataUrl(p.imageUrl);
+    return data
+      ? { type: "image", source: { type: "base64", media_type: data.mediaType, data: data.base64 } }
+      : { type: "image", source: { type: "url", url: p.imageUrl } };
+  }
+  return { type: "text", text: p.text };
+}
 
 /** Default `max_tokens` when Codex omits `max_output_tokens`. */
 const DEFAULT_MAX_TOKENS = 8192;
@@ -45,7 +58,7 @@ function messagesToAnthropicFormat(parsed: OcxParsedRequest, isOAuth: boolean): 
       case "developer": {
         const content = typeof msg.content === "string"
           ? msg.content
-          : (msg.content as OcxTextContent[]).map(p => ({ type: "text", text: p.text }));
+          : (msg.content as OcxContentPart[]).map(toAnthropicContentPart);
         messages.push({ role: "user", content });
         break;
       }

@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from "./base";
-import type { AdapterEvent, OcxAssistantMessage, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTextContent, OcxToolCall } from "../types";
+import type { AdapterEvent, OcxAssistantMessage, OcxContentPart, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTextContent, OcxToolCall } from "../types";
 import { namespacedToolName } from "../types";
 
 function messagesToChatFormat(parsed: OcxParsedRequest): unknown[] {
@@ -21,10 +21,22 @@ function messagesToChatFormat(parsed: OcxParsedRequest): unknown[] {
     switch (msg.role) {
       case "user":
       case "developer": {
-        const content = typeof msg.content === "string"
-          ? msg.content
-          : (msg.content as OcxTextContent[]).map(p => p.text).join("");
-        out.push({ role: msg.role === "developer" ? "system" : "user", content });
+        const role = msg.role === "developer" ? "system" : "user";
+        if (typeof msg.content === "string") {
+          out.push({ role, content: msg.content });
+        } else {
+          const parts = msg.content as OcxContentPart[];
+          if (!parts.some(p => p.type === "image")) {
+            out.push({ role, content: parts.map(p => (p as OcxTextContent).text).join("") });
+          } else {
+            // Vision: chat-completions content-parts array. Images are only valid on the user role,
+            // and the data URL goes straight into image_url.url (never the token-exploding text path).
+            const chatParts = parts.map(p => p.type === "image"
+              ? { type: "image_url", image_url: { url: p.imageUrl, ...(p.detail ? { detail: p.detail } : {}) } }
+              : { type: "text", text: (p as OcxTextContent).text });
+            out.push({ role: "user", content: chatParts });
+          }
+        }
         break;
       }
       case "assistant": {

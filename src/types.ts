@@ -26,7 +26,7 @@ export type OcxMessage =
 
 export interface OcxUserMessage {
   role: "user";
-  content: string | OcxTextContent[];
+  content: string | OcxContentPart[];
   timestamp: number;
 }
 
@@ -39,7 +39,7 @@ export interface OcxAssistantMessage {
 
 export interface OcxDeveloperMessage {
   role: "developer";
-  content: string | OcxTextContent[];
+  content: string | OcxContentPart[];
   timestamp: number;
 }
 
@@ -56,6 +56,17 @@ export interface OcxTextContent {
   type: "text";
   text: string;
 }
+
+export interface OcxImageContent {
+  type: "image";
+  /** A `data:` URL (base64) or a remote https URL — passed through from Codex verbatim, NEVER inlined as text. */
+  imageUrl: string;
+  /** Fidelity hint from Codex: "low" | "high" | "auto". */
+  detail?: string;
+}
+
+/** A user/developer message content part: text or an image (vision). */
+export type OcxContentPart = OcxTextContent | OcxImageContent;
 
 export interface OcxThinkingContent {
   type: "thinking";

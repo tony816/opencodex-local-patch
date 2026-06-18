@@ -2,11 +2,13 @@ import type { ProviderAdapter } from "./base";
 import type {
   AdapterEvent,
   OcxAssistantMessage,
+  OcxContentPart,
   OcxParsedRequest,
   OcxProviderConfig,
   OcxTextContent,
   OcxToolCall,
 } from "../types";
+import { parseDataUrl } from "./image";
 
 function messagesToGeminiFormat(parsed: OcxParsedRequest): { systemInstruction?: unknown; contents: unknown[] } {
   const systemInstruction = parsed.context.systemPrompt?.length
@@ -19,10 +21,20 @@ function messagesToGeminiFormat(parsed: OcxParsedRequest): { systemInstruction?:
     switch (msg.role) {
       case "user":
       case "developer": {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : (msg.content as OcxTextContent[]).map(p => p.text).join("");
-        contents.push({ role: "user", parts: [{ text }] });
+        if (typeof msg.content === "string") {
+          contents.push({ role: "user", parts: [{ text: msg.content }] });
+        } else {
+          const parts = (msg.content as OcxContentPart[]).map(p => {
+            if (p.type === "image") {
+              const data = parseDataUrl(p.imageUrl);
+              // Gemini takes base64 via inline_data; a remote URL needs a mime type we don't have, so
+              // fall back to a short marker rather than inlining the URL as a huge text blob.
+              return data ? { inline_data: { mime_type: data.mediaType, data: data.base64 } } : { text: `[image: ${p.imageUrl}]` };
+            }
+            return { text: p.text };
+          });
+          contents.push({ role: "user", parts });
+        }
         break;
       }
       case "assistant": {

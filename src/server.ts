@@ -174,12 +174,16 @@ async function handleResponses(req: Request, config: OcxConfig, logCtx: { model:
 
   const request = adapter.buildRequest(parsed, { headers: req.headers });
 
+  // Abort the upstream fetch if the client (Codex) disconnects mid-stream, so a cancelled turn does
+  // not leak the upstream connection or keep draining tokens. The bridge's cancel() fires upstream.abort() (RC2).
+  const upstream = new AbortController();
   let upstreamResponse: Response;
   try {
     upstreamResponse = await fetch(request.url, {
       method: request.method,
       headers: request.headers,
       body: request.body,
+      signal: upstream.signal,
     });
   } catch (err) {
     return formatErrorResponse(502, "upstream_error", `Provider unreachable: ${err instanceof Error ? err.message : String(err)}`);
@@ -202,7 +206,7 @@ async function handleResponses(req: Request, config: OcxConfig, logCtx: { model:
       if (t.freeform) freeformToolNames.add(t.name);
       if (t.toolSearch) toolSearchToolNames.add(t.name);
     }
-    const sseStream = bridgeToResponsesSSE(eventStream, parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames);
+    const sseStream = bridgeToResponsesSSE(eventStream, parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames, () => upstream.abort());
     return new Response(sseStream, {
       headers: {
         "Content-Type": "text/event-stream",

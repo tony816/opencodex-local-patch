@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { execFileSync } from "node:child_process";
 import { restoreNativeCodex } from "./codex-inject";
 import { loadConfig, readPid, removePid, writePid } from "./config";
 import { serviceCommand } from "./service";
@@ -88,32 +89,59 @@ function handleStart() {
 }
 
 function killProxy(pid: number): void {
+  if (!isProcessAlive(pid)) return;
   if (process.platform === "win32") {
+    const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
     try {
-      (require("node:child_process") as typeof import("node:child_process"))
-        .execSync(`taskkill /PID ${pid} /T /F`, { stdio: "pipe" });
-    } catch { /* process already gone */ }
+      execFileSync(taskkill, ["/PID", String(pid), "/T", "/F"], { stdio: "pipe" });
+    } catch (err) {
+      if (isProcessAlive(pid)) throw err;
+    }
   } else {
     process.kill(pid, "SIGTERM");
+    if (!waitForExit(pid, 5000)) process.kill(pid, "SIGKILL");
   }
+  if (!waitForExit(pid, 5000)) throw new Error(`process ${pid} did not exit`);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitForExit(pid: number, timeoutMs: number): boolean {
+  const deadline = Date.now() + timeoutMs;
+  const marker = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    Atomics.wait(marker, 0, 0, 50);
+  }
+  return !isProcessAlive(pid);
 }
 
 function handleStop() {
   const pid = readPid();
+  let stopFailed = false;
   if (pid) {
     try {
       killProxy(pid);
       console.log(`✅ Proxy (PID ${pid}) stopped.`);
+      removePid();
     } catch {
-      console.log("Proxy process not found.");
+      stopFailed = true;
+      console.error(`❌ Failed to stop proxy (PID ${pid}).`);
     }
-    removePid();
   } else {
     console.log("No running proxy found.");
   }
   // Recover native Codex so plain `codex` keeps working while the proxy is down.
   const r = restoreNativeCodex();
   console.log(`↩️  ${r.message}`);
+  if (stopFailed) process.exit(1);
 }
 
 function handleStatus() {

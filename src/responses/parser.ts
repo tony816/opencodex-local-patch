@@ -131,8 +131,15 @@ function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
         toolSearch: true,
       });
     }
-    // web_search and image_generation are OpenAI-hosted (executed server-side) with no opencode.ai
-    // equivalent, so they cannot be relayed to a chat model and are intentionally dropped.
+    else if (typeof t.name === "string" && t.type !== "web_search" && t.type !== "image_generation") {
+      // Any OTHER named tool (e.g. a native/computer-use tool type opencodex doesn't explicitly
+      // model) is client-executed — pass it through as a function so the routed model can read and
+      // call it naturally; the bridge relays its call as a function_call. Previously such tools were
+      // silently dropped, so the model never saw them.
+      pushFn(t);
+    }
+    // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
+    // dropped — they're executed by OpenAI and can't be relayed to a routed chat model.
   }
   return out.length > 0 ? out : undefined;
 }

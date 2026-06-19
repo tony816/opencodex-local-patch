@@ -52,10 +52,14 @@ Commits `1528114` (bridge) + `e2ae0b8` (server).
 
 ## Deferred (and why)
 
-- **RC3 idle heartbeat.** Needs the Codex client's production `idle_timeout` (the vendored
-  test uses 1000 ms; `responses.rs:675-676`). A heartbeat interval chosen above the real
-  timeout would be worse than none. Resolve the value, then implement an SSE-comment
-  heartbeat (`30_patch-direction.md` §P1a).
+- **RC3 idle keep-alive.** Investigated: `idle_timeout` is `DEFAULT_STREAM_IDLE_TIMEOUT_MS =
+  300_000` by default but as low as `5_000` / `9_000` for some provider configs
+  (`model-provider-info/src/lib.rs:26`, `model-provider/src/provider.rs:366`,
+  `config/src/thread_config/remote.rs:472`). Critically, a plain SSE **comment does NOT reset**
+  Codex's event-level `timeout(idle_timeout, stream.next())` (`responses.rs:446`,
+  `eventsource_stream`) — the keep-alive must be a real, parser-ignored event
+  (`response.heartbeat`), not a comment. Deferred pending the user's provider `idle_timeout`
+  and maintainer sign-off on the new wire event (`30_patch-direction.md` §P1a, revised).
 - **RC2 passthrough abort.** The passthrough path returns `upstreamResponse.body` directly;
   whether client-cancel propagates to abort the upstream depends on Bun's stream/fetch
   behavior — needs a live check before wiring (avoid breaking high-fidelity passthrough).

@@ -96,21 +96,37 @@ abort callback fired and no unhandled rejection occurs.
 
 ## P1 — Stall and passthrough robustness
 
-### P1a · RC3 — Idle heartbeat (`src/bridge.ts`)
+### P1a · RC3 — Idle keep-alive (`src/bridge.ts`) — REVISED after investigation
 
-Emit an SSE **comment** (`:\n\n`, ignored by the Codex eventsource parser) on an interval
-shorter than Codex's `idle_timeout`, reset on every real emit, cleared on close/cancel.
+**Correction (see `40_p0-implementation.md`):** a plain SSE comment (`:\n\n`) will NOT work.
+Codex's loop is `timeout(idle_timeout, stream.next())` (`responses.rs:446`) over an
+`eventsource_stream` (`responses.rs:12,440`), which parses at the **event** level — a
+comment-only frame dispatches no event per the SSE spec, so `.next()` stays pending and the
+timer is NOT reset. The keep-alive must be a **real SSE event** that deserializes into
+`ResponsesStreamEvent` and is then ignored by the parser's catch-all
+(`responses.rs:426-427`, `_ => Ok(None)`) — e.g. a benign `{"type":"response.heartbeat"}`
+frame emitted WITHOUT consuming the main `sequence_number` counter.
+
+**Observed `idle_timeout` values** (vendored codex): default
+`DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000` (`model-provider-info/src/lib.rs:26`), but provider
+overrides go as low as `5_000` (`model-provider/src/provider.rs:366`) and `9_000`
+(`config/src/thread_config/remote.rs:472,535`). A safe interval is ~2500 ms (under the 5 s floor).
 
 ```ts
-const HEARTBEAT_MS = 10_000;   // must be < Codex idle_timeout; make configurable
-let beat = setInterval(() => { try { controller.enqueue(encoder.encode(":\n\n")); } catch {} }, HEARTBEAT_MS);
-const stop = () => clearInterval(beat);
-// call stop() before controller.close() and in cancel()
+const HEARTBEAT_MS = 2_500;   // under the observed 5 s provider floor; ideally configurable
+const beat = setInterval(() => {
+  if (closed) return;
+  // a REAL event (not a comment) so eventsource_stream yields it and resets Codex's idle timer;
+  // an unhandled type is ignored by the parser. Do NOT bump `seq` (keep real events contiguous).
+  try { controller.enqueue(encoder.encode('event: response.heartbeat\ndata: {"type":"response.heartbeat"}\n\n')); }
+  catch { closed = true; }
+}, HEARTBEAT_MS);
+// clearInterval(beat) before controller.close() and inside cancel()
 ```
 
-**Caveat to verify:** confirm the upstream eventsource lib treats `:`-prefixed lines as
-comments (standard SSE does; `responses.rs:474-478` parses `sse.data`, and comment lines
-carry no `data:`). Heartbeats must never be mistaken for events.
+**Deferred** pending (1) the user's actual provider `idle_timeout` and (2) maintainer sign-off
+on introducing a `response.heartbeat` wire event (a small protocol-surface addition). RC3 is
+medium severity; the P0 fixes ship first.
 
 ### P1b · RC5 — Passthrough header regression test (`tests/`)
 

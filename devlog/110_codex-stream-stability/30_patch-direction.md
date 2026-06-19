@@ -96,7 +96,7 @@ abort callback fired and no unhandled rejection occurs.
 
 ## P1 — Stall and passthrough robustness
 
-### P1a · RC3 — Idle keep-alive (`src/bridge.ts`) — REVISED after investigation
+### P1a · RC3 — Idle keep-alive (`src/bridge.ts`) — IMPLEMENTED (`61dcec2`)
 
 **Correction (see `40_p0-implementation.md`):** a plain SSE comment (`:\n\n`) will NOT work.
 Codex's loop is `timeout(idle_timeout, stream.next())` (`responses.rs:446`) over an
@@ -124,9 +124,13 @@ const beat = setInterval(() => {
 // clearInterval(beat) before controller.close() and inside cancel()
 ```
 
-**Deferred** pending (1) the user's actual provider `idle_timeout` and (2) maintainer sign-off
-on introducing a `response.heartbeat` wire event (a small protocol-surface addition). RC3 is
-medium severity; the P0 fixes ship first.
+**Implemented** (`61dcec2`): a real, parser-ignored `response.heartbeat` emitted only during
+upstream silence (an `activity` flag skips ticks when real events flow), interval 2000 ms (under
+the 5 s provider floor), cleared on every terminal path + close + cancel. The earlier "needs the
+user's idle_timeout / maintainer sign-off" concern was retired by an independent review: a ~2 s
+interval covers the worst floor without the value, and unknown event types are codex's own
+forward-compat path (`responses.rs:426-431`, `_ => Ok(None)`), so emitting one is in-contract.
+Unit-tested in `tests/bridge-lifecycle.test.ts` (heartbeat appears during silence).
 
 ### P1b · RC5 — Passthrough header regression test (`tests/`)
 

@@ -40,6 +40,16 @@ A directly-relayed body does not propagate the consumer's cancel to a signalled 
 with a `Bun.serve` probe and `tests/passthrough-abort.test.ts`), so this closes the passthrough
 half of RC2 with byte-verbatim fidelity preserved.
 
+### RC3 — idle keep-alive (`src/bridge.ts`) [patch-direction §P1a]
+
+Commit `61dcec2`. During upstream silence the bridge emits a real, parser-ignored
+`response.heartbeat` (~2 s interval, fired only when no real event occurred since the last tick),
+re-arming Codex's `timeout(idle_timeout, stream.next())` so a stalled routed provider never trips
+"idle timeout waiting for SSE". Unknown event types are codex's documented forward-compat path
+(`responses.rs:426-431`, `_ => Ok(None)`) with zero side-effects; the 2 s interval is under the 5 s
+provider floor, so the user's exact `idle_timeout` is not required. Cleared on every terminal path,
+close, and cancel. Native passthrough is unaffected. Unit-tested (`tests/bridge-lifecycle.test.ts`).
+
 ## RC status after P0
 
 | ID | Cause | Status |
@@ -47,7 +57,7 @@ half of RC2 with byte-verbatim fidelity preserved.
 | RC1 | Missing terminal `response.completed` (bridge) | **Fixed** (`1528114`) + unit-tested |
 | RC2 | Double-throw on disconnect | **Fixed** (`1528114`) |
 | RC2 | Upstream not aborted on disconnect (both paths) | **Fixed** — bridge (`e2ae0b8`), passthrough `relayWithAbort` (`955f3dd`, Bun.serve-probe verified) |
-| RC3 | No idle heartbeat | **Deferred** (needs production `idle_timeout` value) |
+| RC3 | No idle keep-alive (idle-timeout aborts) | **Fixed** (`61dcec2`) — parser-ignored `response.heartbeat` during silence, unit-tested |
 | RC4 | Bridge error envelope | Fixed in 100.5 (`a0d4ec9`); `rate_limit_exceeded` note stands |
 | RC5 | Passthrough header fidelity | Mitigated in 100.5; regression already covered by `tests/error-fidelity.test.ts` |
 
@@ -60,16 +70,14 @@ half of RC2 with byte-verbatim fidelity preserved.
 
 ## Deferred (and why)
 
-- **RC3 idle keep-alive.** Investigated: `idle_timeout` is `DEFAULT_STREAM_IDLE_TIMEOUT_MS =
-  300_000` by default but as low as `5_000` / `9_000` for some provider configs
-  (`model-provider-info/src/lib.rs:26`, `model-provider/src/provider.rs:366`,
-  `config/src/thread_config/remote.rs:472`). Critically, a plain SSE **comment does NOT reset**
-  Codex's event-level `timeout(idle_timeout, stream.next())` (`responses.rs:446`,
-  `eventsource_stream`) — the keep-alive must be a real, parser-ignored event
-  (`response.heartbeat`), not a comment. Deferred pending the user's provider `idle_timeout`
-  and maintainer sign-off on the new wire event (`30_patch-direction.md` §P1a, revised).
-- **P2** (rate-limit code mapping, dropped-frame logging) — opportunistic; current behavior
-  is acceptable.
+- **P2** (rate-limit code mapping, dropped-frame logging) — opportunistic only; current behavior
+  is acceptable. The streaming path is deliberately quiet (no `console.*` in any adapter/bridge),
+  so dropped-frame logging needs a logging-convention decision and risks spam on benign non-JSON
+  frames; rate_limit → `Retryable` is already correct. Not shipped.
+
+(RC3 idle keep-alive was initially deferred here, then implemented in `61dcec2` after an
+independent review retired the deferral rationale — see the RC3 subsection above and
+`30_patch-direction.md` §P1a.)
 
 ## Remaining acceptance gate
 

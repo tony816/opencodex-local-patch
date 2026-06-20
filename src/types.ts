@@ -174,6 +174,8 @@ export interface OcxConfig {
   subagentModels?: string[];
   /** Routed model ids ("<provider>/<model>") hidden from Codex (excluded from the catalog + /v1/models). */
   disabledModels?: string[];
+  /** Advertise supports_websockets so Codex opens the WS endpoint (phase 120). Default false. */
+  websockets?: boolean;
   /** Freshness window (ms) for the per-provider live `/models` cache. Defaults to 5 min. */
   modelCacheTtlMs?: number;
   /** Web-search sidecar: route web_search for non-OpenAI models through a gpt-mini via ChatGPT passthrough. */

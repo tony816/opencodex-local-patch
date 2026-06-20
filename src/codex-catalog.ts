@@ -192,7 +192,7 @@ function deriveEntry(template: RawEntry | null, slug: string, desc: string, prio
  * catalog sync and the proxy `/v1/models?client_version` branch.
  * Native gpt slugs stay bare; routed models are namespaced `<provider>/<model>`.
  */
-export function buildCatalogEntries(template: RawEntry | null, gptSlugs: string[], goModels: CatalogModel[], featured?: string[]): RawEntry[] {
+export function buildCatalogEntries(template: RawEntry | null, gptSlugs: string[], goModels: CatalogModel[], featured?: string[], wsEnabled = false): RawEntry[] {
   // Codex's models-manager sorts by `priority` ASC and advertises the first 5 picker-visible
   // models to spawn_agent (sort_by_key(priority) + MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT=5). Catalog
   // ARRAY order is discarded — so "featuring" a model = giving it the LOWEST priority (0..N-1) so
@@ -209,6 +209,13 @@ export function buildCatalogEntries(template: RawEntry | null, gptSlugs: string[
     const e = deriveEntry(template, slug, `Routed via opencodex → ${m.provider} (${m.owned_by ?? m.provider}).`, 5);
     if (rank.has(slug)) e.priority = rank.get(slug)!;
     out.push(e);
+  }
+  // Central capability override (phase 120.4): the advertised flag must match the implemented WS
+  // endpoint. Overrides both the routed strip (normalizeRoutedCatalogEntry) and any native template
+  // leak (deriveEntry clones the template as-is for native slugs).
+  for (const entry of out) {
+    if (wsEnabled) entry.supports_websockets = true;
+    else delete entry.supports_websockets;
   }
   return out;
 }
@@ -327,7 +334,7 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{ added: num
   const featured = config.subagentModels ?? [];
   const rank = new Map(featured.map((slug, i) => [slug, i] as const));
   const orderedGoModels = orderForSubagents(enabledGo, featured); // stable tie-break among equal priorities
-  const goEntries = buildCatalogEntries(template ? JSON.parse(JSON.stringify(template)) : null, [], orderedGoModels, featured);
+  const goEntries = buildCatalogEntries(template ? JSON.parse(JSON.stringify(template)) : null, [], orderedGoModels, featured, config.websockets ?? false);
   // Keep genuine native entries (gpt-*, codex-*) with their real per-model fields, but drop bare
   // duplicates of routed models (replaced by namespaced entries) + any prior "/" entries. Re-derive
   // each native's priority from the pristine baseline so featuring a native is reversible.
@@ -340,7 +347,16 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{ added: num
       const priority = rank.has(slug) ? rank.get(slug)! : (baseline.get(slug) ?? (m.priority as number));
       return normalizeServiceTiers({ ...m, priority });
     });
-  catalog.models = [...native, ...goEntries].map(m => normalizeServiceTiers(m));
+  // Central WS capability override on the FINAL on-disk catalog (the file Codex reads). Applies to
+  // native AND routed so the advertised flag matches the implemented endpoint (phase 120.4) and a
+  // native template can never leak supports_websockets while the flag is off.
+  const wsEnabled = config.websockets ?? false;
+  catalog.models = [...native, ...goEntries].map(m => {
+    const e = normalizeServiceTiers(m);
+    if (wsEnabled) e.supports_websockets = true;
+    else delete e.supports_websockets;
+    return e;
+  });
 
   try {
     if (!existsSync(OCX_DIR)) mkdirSync(OCX_DIR, { recursive: true });

@@ -9,6 +9,11 @@ errors? Is adding WS to the `chat/completions` adapter worthwhile?
 (`10_root-cause-analysis.md`), not transport-bandwidth defects. No transport change touches
 RC1–RC5. The phase 100 "no WebSocket" decision stands and is reaffirmed here.
 
+> **Cross-link (amended, not reversed):** this verdict is about routed *reliability/performance*
+> — still correct. Native transport *parity* (satisfying Codex's `supports_websockets`
+> capability so `ocx` is a drop-in for the native OpenAI provider) is a different axis, tracked
+> in `devlog/120_codex-websocket-parity/`. See `120/02_transport-decision.md`.
+
 ## Phase 100 already decided this
 
 > "Decision: no 100.6 websocket spike / routed providers keep `supports_websockets`

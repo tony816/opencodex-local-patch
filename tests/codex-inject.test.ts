@@ -2,19 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { buildProviderTableBlock, stripOpencodexConfig } from "../src/codex-inject";
 
 describe("Codex config injection", () => {
-  test("advertises provider-level Responses WebSocket support by default", () => {
+  test("omits provider-level Responses WebSocket support by default", () => {
     const block = buildProviderTableBlock(10100);
 
     expect(block).toContain("[model_providers.opencodex]");
     expect(block).toContain('wire_api = "responses"');
     expect(block).toContain("requires_openai_auth = true");
-    expect(block).toContain("supports_websockets = true");
+    expect(block).not.toContain("supports_websockets");
   });
 
-  test("can omit provider-level Responses WebSocket support for explicit opt-out", () => {
-    const block = buildProviderTableBlock(10100, false);
+  test("can advertise provider-level Responses WebSocket support for explicit opt-in", () => {
+    const block = buildProviderTableBlock(10100, true);
 
-    expect(block).not.toContain("supports_websockets");
+    expect(block).toContain("supports_websockets = true");
   });
 
   test("removes stale root context-window overrides so catalog limits drive Codex", () => {

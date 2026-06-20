@@ -62,7 +62,7 @@ describe("Codex catalog routed normalization", () => {
     expect(routed).not.toHaveProperty("tool_mode");
     expect(routed).not.toHaveProperty("multi_agent_version");
     expect(routed).not.toHaveProperty("use_responses_lite");
-    expect(routed?.supports_websockets).toBe(true);
+    expect(routed).not.toHaveProperty("supports_websockets");
     expect(routed).not.toHaveProperty("additional_speed_tiers");
     expect(routed).not.toHaveProperty("service_tier");
     expect(routed).not.toHaveProperty("service_tiers");
@@ -99,22 +99,22 @@ describe("Codex catalog routed normalization", () => {
     expect(native?.tool_mode).toBe("code");
     expect(native?.multi_agent_version).toBe("v2");
     expect(native?.use_responses_lite).toBe(true);
-    // 120.4: native websocket advertisement is applied by the central capability override.
-    expect(native?.supports_websockets).toBe(true);
+    // Phase 132: websocket advertisement is explicit opt-in, not inherited from templates.
+    expect(native).not.toHaveProperty("supports_websockets");
     expect(native?.web_search_tool_type).toBe("text_and_image");
     expect(native?.supports_search_tool).toBe(true);
     expect(native?.service_tier).toBe("priority");
     expect(native?.service_tiers).toEqual([{ id: "priority" }]);
   });
 
-  test("buildCatalogEntries advertises supports_websockets by default and disables only on explicit false (120.4 hotfix)", () => {
+  test("buildCatalogEntries advertises supports_websockets only on explicit opt-in", () => {
     const goModels = [{ provider: "anthropic", id: "claude-sonnet-4-6", owned_by: "anthropic" }];
 
-    const off = buildCatalogEntries(nativeTemplate(), ["gpt-5.5"], goModels, undefined, false);
+    const off = buildCatalogEntries(nativeTemplate(), ["gpt-5.5"], goModels);
     expect(off.find(e => e.slug === "gpt-5.5")).not.toHaveProperty("supports_websockets");
     expect(off.find(e => e.slug === "anthropic/claude-sonnet-4-6")).not.toHaveProperty("supports_websockets");
 
-    const on = buildCatalogEntries(nativeTemplate(), ["gpt-5.5"], goModels);
+    const on = buildCatalogEntries(nativeTemplate(), ["gpt-5.5"], goModels, undefined, true);
     expect(on.find(e => e.slug === "gpt-5.5")?.supports_websockets).toBe(true);
     expect(on.find(e => e.slug === "anthropic/claude-sonnet-4-6")?.supports_websockets).toBe(true);
   });

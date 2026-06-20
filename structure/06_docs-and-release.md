@@ -42,5 +42,28 @@ manual. When an investigation graduates into a maintained invariant, summarize i
 ## Release workflow
 
 Package release is npm-focused. `package.json` exposes `opencodex` and `ocx`, `prepublishOnly` runs
-typecheck and GUI build, and `scripts/release.ts` handles version bump, commit/push, and dispatching
-the GitHub Release workflow. Docs publishing is separate from npm release publishing.
+typecheck and GUI build, and `scripts/release.ts` handles version bump, commit/push, waiting for
+Cross-platform CI, and dispatching the GitHub Release workflow. Docs publishing is separate from npm
+release publishing.
+
+## Cross-platform CI
+
+`.github/workflows/ci.yml` is the ordinary quality gate for runtime/package changes. It runs on
+Linux and Windows only, using the intentionally short command set:
+
+```bash
+bun install --frozen-lockfile
+bun x tsc --noEmit
+bun test tests
+bun build scripts/release.ts --target=bun --outdir=.tmp/ci-release-script-check
+bun run src/cli.ts help
+```
+
+The CI intentionally does not build docs, build the GUI, run coverage, run macOS, or perform remote
+Ubuntu/RDP smoke tests. Those stay outside the default gate until a concrete regression justifies the
+extra runtime.
+
+The Release workflow remains manual and publish-focused. Before any dry-run or publish step, it
+checks that the exact release commit (`GITHUB_SHA`) already has a successful Cross-platform CI run.
+This keeps release runs short and makes release a deployment of a verified commit rather than a
+second CI pipeline.

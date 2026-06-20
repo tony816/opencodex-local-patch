@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: write # create the matching GitHub Release + version tag after npm publish
+  actions: read # verify the release commit already passed Cross-platform CI
   id-token: write # OIDC auth for Trusted Publishing + automatic provenance attestation
 
 concurrency:
@@ -71,6 +72,35 @@ jobs:
             echo "::error::package.json ($PKG) != requested (${{ inputs.version }}) — bump package.json on main first";
             exit 1;
           }
+
+      - name: Require successful Cross-platform CI for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Release must run from main; got ${GITHUB_REF}"
+            exit 1
+          fi
+
+          ci_url="$(
+            gh run list \
+              --workflow ci.yml \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 10 \
+              --json conclusion,headSha,url,workflowName \
+              --jq '.[0].url // ""'
+          )"
+
+          if [ -z "$ci_url" ]; then
+            echo "::error::No successful Cross-platform CI run found for ${GITHUB_SHA}. Wait for CI to pass before releasing."
+            gh run list --workflow ci.yml --commit "$GITHUB_SHA" --limit 10 || true
+            exit 1
+          fi
+
+          echo "Cross-platform CI passed for ${GITHUB_SHA}: ${ci_url}"
 
       # Tokenless publish via Trusted Publishing (OIDC) — NO NPM_TOKEN secret. npm auto-detects the
       # OIDC environment (`id-token: write` above) and generates provenance automatically, so neither a

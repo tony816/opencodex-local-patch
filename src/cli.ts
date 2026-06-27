@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { execFileSync, spawn } from "node:child_process";
-import { rmSync } from "node:fs";
+import { mkdirSync, openSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { restoreNativeCodex } from "./codex-inject";
 import { restoreLegacyOpenaiHistory } from "./codex-history-provider";
 import { codexAutoStartEnabled, getConfigDir, getConfigPath, loadConfig, readPid, removePid, saveConfig, writePid } from "./config";
@@ -247,9 +248,12 @@ async function handleEnsure() {
     return;
   }
 
+  mkdirSync(getConfigDir(), { recursive: true });
+  const serviceLogPath = join(getConfigDir(), "opencodex-service.log");
+  const serviceLogFd = openSync(serviceLogPath, "a");
   const child = spawn(process.execPath, [process.argv[1], "start"], {
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", serviceLogFd, serviceLogFd],
     env: { ...process.env, OCX_SERVICE: "1" },
   });
   child.unref();

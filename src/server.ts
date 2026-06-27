@@ -68,6 +68,7 @@ export function registerTurn(ac: AbortController): void { activeTurns.add(ac); }
 export function unregisterTurn(ac: AbortController): void { activeTurns.delete(ac); }
 export function isDraining(): boolean { return draining; }
 export function getActiveTurnCount(): number { return activeTurns.size; }
+export function beginDraining(): void { draining = true; }
 
 export function trackStreamLifetime(
   body: ReadableStream<Uint8Array>,
@@ -1160,12 +1161,23 @@ async function handleManagementAPI(req: Request, url: URL, config: OcxConfig): P
   }
 
   if (url.pathname === "/api/stop" && req.method === "POST") {
+    const force = url.searchParams.get("force") === "1";
+    const activeTurnCount = getActiveTurnCount();
+    if (activeTurnCount > 0 && !force) {
+      return jsonResponse({
+        success: false,
+        error: "proxy_busy",
+        activeTurns: activeTurnCount,
+        message: `Proxy has ${activeTurnCount} active turn(s); stop refused to avoid interrupting work. Use ocx stop --force to abort.`,
+      }, 409);
+    }
+    beginDraining();
     const { restoreNativeCodex } = await import("./codex-inject");
     const { stopServiceIfInstalled } = await import("./service");
     stopServiceIfInstalled();
     restoreNativeCodex();
     setTimeout(async () => {
-      await drainAndShutdown(undefined, config.shutdownTimeoutMs ?? 5000);
+      await drainAndShutdown(undefined, force ? 0 : config.shutdownTimeoutMs ?? 5000);
       process.exit(0);
     }, 200);
     return jsonResponse({ success: true, message: "Proxy stopping, native Codex restored." });
@@ -1261,7 +1273,13 @@ export function startServer(port?: number) {
       }
 
       if (url.pathname === "/healthz" && req.method === "GET") {
-        return jsonResponse({ status: "ok", version: VERSION, uptime: process.uptime() });
+        return jsonResponse({
+          status: "ok",
+          version: VERSION,
+          uptime: process.uptime(),
+          activeTurns: getActiveTurnCount(),
+          draining: isDraining(),
+        });
       }
 
       if (url.pathname.startsWith("/api/")) {

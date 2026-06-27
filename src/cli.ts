@@ -30,7 +30,7 @@ function printUsage() {
 Usage:
   ocx init                    Interactive setup (provider + Codex config injection)
   ocx start [--port <port>]   Start the proxy server (auto-syncs models to Codex)
-  ocx stop                    Stop the proxy AND restore native Codex (plain codex works again)
+  ocx stop [--force]          Stop only when idle, restore native Codex; --force aborts work
   ocx restore                 Restore native Codex without stopping (alias: eject)
   ocx recover-history --legacy-openai
                                Explicitly recover pre-backup syncResumeHistory rows
@@ -66,7 +66,7 @@ function printSubcommandUsage(name: string | undefined): void {
       console.log("Usage: ocx start [--port <port>]\n\nStart the proxy server and sync models to Codex.");
       break;
     case "stop":
-      console.log("Usage: ocx stop\n\nStop the proxy and restore native Codex config.");
+      console.log("Usage: ocx stop [--force]\n\nStop the proxy only when idle and restore native Codex config. Use --force to abort active work.");
       break;
     case "restore":
     case "eject":
@@ -151,6 +151,10 @@ function parsePortOption(): number | undefined {
     process.exit(1);
   }
   return port;
+}
+
+function hasFlag(name: string, shortName?: string): boolean {
+  return args.includes(name) || (shortName ? args.includes(shortName) : false);
 }
 
 function healthHost(hostname?: string): string {
@@ -305,7 +309,79 @@ function waitForExit(pid: number, timeoutMs: number): boolean {
   return !isProcessAlive(pid);
 }
 
-function handleStop() {
+async function requestGracefulProxyStop(port: number, hostname: string | undefined, force: boolean): Promise<{ ok: boolean; busy: boolean; message: string }> {
+  const url = `http://${healthHost(hostname)}:${port}/api/stop${force ? "?force=1" : ""}`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal: AbortSignal.timeout(1_500),
+    });
+    const body = await response.json().catch(() => ({})) as { message?: unknown; activeTurns?: unknown; error?: unknown };
+    const active = typeof body.activeTurns === "number" ? ` (${body.activeTurns} active turn(s))` : "";
+    return {
+      ok: response.ok,
+      busy: response.status === 409 || body.error === "proxy_busy",
+      message: typeof body.message === "string" ? body.message : `${response.status} ${response.statusText}${active}`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      busy: false,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function waitForProxyDown(port: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!await proxyHealthy(port)) return true;
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  return !await proxyHealthy(port);
+}
+
+async function handleStop() {
+  const force = hasFlag("--force", "-f");
+  const config = loadConfig();
+  const port = config.port ?? 10100;
+  const stopPid = readPid();
+
+  if (await proxyHealthy(port)) {
+    const stop = await requestGracefulProxyStop(port, config.hostname, force);
+    if (stop.busy) {
+      console.error(`Proxy has active work: ${stop.message}`);
+      console.error("Proxy left running so the active Codex turn is not interrupted.");
+      process.exit(1);
+    }
+    if (stop.ok) {
+      const stoppedService = stopServiceIfInstalled();
+      if (stoppedService) console.log("Service manager stopped (won't respawn).");
+      if (await waitForProxyDown(port)) {
+        if (stopPid) removePid(stopPid);
+        console.log("Proxy stopped gracefully.");
+        return;
+      }
+      if (!force) {
+        console.error("Graceful stop was accepted but the proxy is still reachable; not forcing shutdown.");
+        process.exit(1);
+      }
+    } else if (!force) {
+      const r = restoreNativeCodex();
+      console.log(r.message);
+      console.error(`Could not request graceful proxy stop: ${stop.message}`);
+      console.error("Proxy left running to avoid interrupting in-flight work. Use 'ocx stop --force' to abort it.");
+      process.exit(1);
+    }
+  }
+
+  if (!force && stopPid && isProcessAlive(stopPid)) {
+    const r = restoreNativeCodex();
+    console.log(r.message);
+    console.error(`Proxy health is unreachable but PID ${stopPid} is still alive; not force-killing it during possible work.`);
+    console.error("Use 'ocx stop --force' only when you want to abort any in-flight turn.");
+    process.exit(1);
+  }
   const stoppedService = stopServiceIfInstalled();
   if (stoppedService) console.log("🛑 Service manager stopped (won't respawn).");
 
@@ -452,7 +528,7 @@ switch (command) {
     await handleStart();
     break;
   case "stop":
-    handleStop();
+    await handleStop();
     break;
   case "restore":
   case "eject": {

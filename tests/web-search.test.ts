@@ -48,6 +48,33 @@ describe("web-search sidecar planning", () => {
     expect(parsed.context.tools?.map(t => t.name)).toEqual(["read_file"]);
   });
 
+  test("parseRequest normalizes null or missing function parameter schema types", () => {
+    const parsed = parseRequest({
+      model: "routed/model",
+      input: "Use tools",
+      stream: true,
+      tools: [
+        {
+          type: "function",
+          name: "codex_app__automation_update",
+          description: "Update automations",
+          parameters: { type: null, properties: { title: { type: "string" } } },
+        },
+        {
+          type: "function",
+          name: "missing_schema_type",
+          description: "Missing type",
+          parameters: { properties: { title: { type: "string" } } },
+        },
+      ],
+    });
+
+    expect(parsed.context.tools?.map(t => [t.namespace, t.name, t.parameters.type])).toEqual([
+      [undefined, "codex_app__automation_update", "object"],
+      [undefined, "missing_schema_type", "object"],
+    ]);
+  });
+
   test("planWebSearch activates only for routed requests with forward auth and incoming authorization", () => {
     const parsed = parsedWithWebSearch();
     const plan = planWebSearch(

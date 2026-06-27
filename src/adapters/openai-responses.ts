@@ -22,24 +22,44 @@ export const FORWARD_HEADERS = [
   "x-responsesapi-include-timing-metrics",
 ];
 
-function sanitizeReasoningInputContent(body: unknown): unknown {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeToolParameters(parameters: unknown): Record<string, unknown> {
+  if (!isRecord(parameters)) return { type: "object", properties: {} };
+  if (parameters.type === "object") return parameters;
+  return { ...parameters, type: "object" };
+}
+
+function sanitizeResponsesBody(body: unknown): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const raw = body as Record<string, unknown>;
-  if (!Array.isArray(raw.input)) return body;
 
   let changed = false;
-  const input = raw.input.map(item => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
-    const rec = item as Record<string, unknown>;
-    if (rec.type !== "reasoning" || !Array.isArray(rec.content) || rec.content.length === 0) return item;
-    changed = true;
-    // Routed models can produce raw `reasoning_text` output items. Codex echoes those in later
-    // native GPT requests, but ChatGPT's Responses backend accepts reasoning input only with empty
-    // `content`; keep summaries/ids and drop the raw content so native passthrough does not 400.
-    return { ...rec, content: [] };
-  });
+  const input = Array.isArray(raw.input)
+    ? raw.input.map(item => {
+      if (!isRecord(item)) return item;
+      if (item.type !== "reasoning" || !Array.isArray(item.content) || item.content.length === 0) return item;
+      changed = true;
+      // Routed models can produce raw `reasoning_text` output items. Codex echoes those in later
+      // native GPT requests, but ChatGPT's Responses backend accepts reasoning input only with empty
+      // `content`; keep summaries/ids and drop the raw content so native passthrough does not 400.
+      return { ...item, content: [] };
+    })
+    : raw.input;
 
-  return changed ? { ...raw, input } : body;
+  const tools = Array.isArray(raw.tools)
+    ? raw.tools.map(tool => {
+      if (!isRecord(tool) || tool.type !== "function") return tool;
+      const parameters = sanitizeToolParameters(tool.parameters);
+      if (parameters === tool.parameters) return tool;
+      changed = true;
+      return { ...tool, parameters };
+    })
+    : raw.tools;
+
+  return changed ? { ...raw, input, tools } : body;
 }
 
 export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): ProviderAdapter & { passthrough: true } {
@@ -82,7 +102,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         url,
         method: "POST",
         headers,
-        body: JSON.stringify(sanitizeReasoningInputContent(parsed._rawBody)),
+        body: JSON.stringify(sanitizeResponsesBody(parsed._rawBody)),
       };
     },
 

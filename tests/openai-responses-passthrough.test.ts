@@ -46,4 +46,38 @@ describe("OpenAI Responses passthrough sanitization", () => {
       content: [{ type: "input_text", text: "hi" }],
     });
   });
+
+  test("normalizes function tool parameter schemas before native GPT passthrough", () => {
+    const adapter = createResponsesPassthroughAdapter(provider);
+    const request = adapter.buildRequest({
+      modelId: "gpt-5.5",
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: {
+        model: "gpt-5.5",
+        input: "hi",
+        tools: [
+          {
+            type: "function",
+            name: "codex_app__automation_update",
+            description: "Update automations",
+            parameters: { type: null, properties: { title: { type: "string" } } },
+          },
+          {
+            type: "function",
+            name: "missing_schema_type",
+            description: "Missing type",
+            parameters: { properties: { title: { type: "string" } } },
+          },
+          { type: "web_search" },
+        ],
+      },
+    }, { headers: new Headers({ authorization: "Bearer token" }) });
+    const body = JSON.parse(request.body) as { tools: Record<string, unknown>[] };
+
+    expect(body.tools[0].parameters).toMatchObject({ type: "object" });
+    expect(body.tools[1].parameters).toMatchObject({ type: "object" });
+    expect(body.tools[2]).toEqual({ type: "web_search" });
+  });
 });

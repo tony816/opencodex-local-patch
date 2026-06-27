@@ -739,6 +739,15 @@ function consumeForInspection(
   const decoder = new TextDecoder();
   let buffer = "";
   let reported = false;
+  const report = (status: ResponsesTerminalStatus) => {
+    if (reported) return;
+    reported = true;
+    try {
+      onTerminal(status);
+    } catch (error) {
+      console.error(`[stream-inspection] terminal recorder failed: ${errorMessage(error)}`);
+    }
+  };
   const pump = async () => {
     try {
       for (;;) {
@@ -749,10 +758,10 @@ function consumeForInspection(
             const payload = sseDataPayload(buffer);
             if (payload) {
               const status = terminalStatusFromSsePayload(payload);
-              if (status) { reported = true; onTerminal(status); }
+              if (status) report(status);
             }
           }
-          if (!reported) onTerminal("incomplete");
+          if (!reported) report("incomplete");
           return;
         }
         buffer += decoder.decode(value, { stream: true });
@@ -763,16 +772,19 @@ function consumeForInspection(
             const payload = sseDataPayload(next.block);
             if (payload) {
               const status = terminalStatusFromSsePayload(payload);
-              if (status) { reported = true; onTerminal(status); }
+              if (status) report(status);
             }
           }
         }
       }
     } catch {
-      if (!reported) onTerminal("incomplete");
+      if (!reported) report("incomplete");
     }
   };
-  pump();
+  void pump().catch(error => {
+    console.error(`[stream-inspection] background inspection failed: ${errorMessage(error)}`);
+    if (!reported) report("incomplete");
+  });
 }
 
 /**
@@ -816,6 +828,24 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function logRequestError(scope: string, req: Request, error: unknown): void {
+  console.error(`[${scope}] ${req.method} ${req.url} failed: ${errorMessage(error)}`);
+}
+
+function managementErrorResponse(req: Request, error: unknown): Response {
+  logRequestError("management-api", req, error);
+  return jsonResponse({ error: "internal proxy error", detail: errorMessage(error) }, 500);
+}
+
+function dataPlaneErrorResponse(req: Request, error: unknown): Response {
+  logRequestError("data-plane", req, error);
+  return formatErrorResponse(502, "proxy_error", `Proxy request failed: ${errorMessage(error)}`);
 }
 
 function isLocalOrigin(req: Request): boolean {
@@ -1219,7 +1249,7 @@ export function startServer(port?: number) {
             console.error(`[codex-auth] Pool account ${safeAccountLabel} token failed during websocket upgrade; reauthentication required`);
             return formatErrorResponse(401, "authentication_error", "Selected Codex account needs reauthentication");
           }
-          throw err;
+          return dataPlaneErrorResponse(req, err);
         }
         if (server.upgrade(req, {
           data: {
@@ -1237,11 +1267,17 @@ export function startServer(port?: number) {
       if (url.pathname.startsWith("/api/")) {
         const apiAuthError = requireApiAuth(req, config, "management");
         if (apiAuthError) return apiAuthError;
-        const mgmtResponse = await handleManagementAPI(req, url, config);
+        let mgmtResponse: Response | null;
+        try {
+          mgmtResponse = await handleManagementAPI(req, url, config);
+        } catch (err) {
+          return managementErrorResponse(req, err);
+        }
         if (mgmtResponse) return mgmtResponse;
       }
 
       if (url.pathname === "/v1/models" && req.method === "GET") {
+        try {
         const goModels = await fetchAllModels(config);
         const { buildCatalogEntries, loadCatalogTemplate, nativeOpenAiSlugs, orderForSubagents } = await import("./codex-catalog");
         const nativeSlugs = nativeOpenAiSlugs();
@@ -1260,6 +1296,9 @@ export function startServer(port?: number) {
           ...goOrdered.map(m => ({ id: `${m.provider}/${m.id}`, object: "model", created: 0, owned_by: m.owned_by ?? m.provider })),
         ];
         return jsonResponse({ object: "list", data });
+        } catch (err) {
+          return dataPlaneErrorResponse(req, err);
+        }
       }
 
       if (url.pathname === "/v1/responses" && req.method === "POST") {
@@ -1274,7 +1313,12 @@ export function startServer(port?: number) {
         const start = Date.now();
         const requestId = nextRequestLogId(start);
         const logCtx = { model: "unknown", provider: "unknown" };
-        const response = await handleResponses(req, config, logCtx);
+        let response: Response;
+        try {
+          response = await handleResponses(req, config, logCtx);
+        } catch (err) {
+          response = dataPlaneErrorResponse(req, err);
+        }
         const errorCode = requestLogErrorCode(response.status);
         addRequestLog({
           requestId,

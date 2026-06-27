@@ -78,6 +78,12 @@ function mapToolChoice(value: unknown): OcxRequestOptions["toolChoice"] {
   return undefined;
 }
 
+function normalizeToolParameters(parameters: unknown): Record<string, unknown> {
+  if (!isObj(parameters)) return { type: "object", properties: {} };
+  if (parameters.type === "object") return parameters;
+  return { ...parameters, type: "object" };
+}
+
 function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
   if (!tools) return undefined;
   const out: OcxTool[] = [];
@@ -85,7 +91,7 @@ function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
     const tool: OcxTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
-      parameters: (t.parameters ?? {}) as Record<string, unknown>,
+      parameters: normalizeToolParameters(t.parameters),
     };
     if (t.strict !== undefined) tool.strict = t.strict as boolean;
     if (namespace) tool.namespace = namespace;
@@ -120,14 +126,14 @@ function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
       out.push({
         name: "tool_search",
         description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-        parameters: (isObj(t.parameters) ? t.parameters : {
+        parameters: normalizeToolParameters(isObj(t.parameters) ? t.parameters : {
           type: "object",
           properties: {
             query: { type: "string", description: "Search query for tools to load." },
             limit: { type: "number", description: "Maximum number of tools to return." },
           },
           required: ["query"],
-        }) as Record<string, unknown>,
+        }),
         toolSearch: true,
       });
     }

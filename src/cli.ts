@@ -12,6 +12,17 @@ import { maybeShowStarPrompt } from "./star-prompt";
 const args = process.argv.slice(2);
 const command = args[0];
 
+function installProcessErrorGuards(): void {
+  process.on("unhandledRejection", reason => {
+    console.error("Unhandled background error:", reason instanceof Error ? reason.stack ?? reason.message : String(reason));
+  });
+  process.on("uncaughtException", error => {
+    console.error("Uncaught proxy error:", error instanceof Error ? error.stack ?? error.message : String(error));
+  });
+}
+
+installProcessErrorGuards();
+
 function printUsage() {
   console.log(`opencodex (ocx) — Universal provider proxy for Codex
 

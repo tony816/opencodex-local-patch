@@ -368,6 +368,34 @@ describe("repairCodexBundledPlugins", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("falls back to the configured healthy marketplace when live app discovery is unavailable", () => {
+    const configured = mkdtempSync(join(tmpdir(), "ocx-configured-market-"));
+    mkdirSync(join(configured, ".agents", "plugins"), { recursive: true });
+    writeFileSync(join(configured, ".agents", "plugins", "marketplace.json"), "{}", "utf8");
+    const { dir, configPath } = makeConfig(
+      `[marketplaces.openai-bundled]\nsource_type = "local"\nsource = ${JSON.stringify(configured)}\n`,
+    );
+    try {
+      const result = repairCodexBundledPlugins({
+        platform: "win32",
+        configPath,
+        locateCurrent: () => null,
+        enableCommonPlugins: true,
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.marketplacePath).toBe(configured);
+        expect(result.enabledPlugins).toEqual(["computer-use", "browser", "chrome"]);
+      }
+      const text = readFileSync(configPath, "utf8");
+      expect(text).toContain(`source = ${JSON.stringify(configured)}`);
+      expect(text).toContain(`[plugins."computer-use@openai-bundled"]`);
+    } finally {
+      rmSync(configured, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("ocx status --json codexPlugins (spawned, read-only)", () => {

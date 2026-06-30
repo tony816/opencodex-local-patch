@@ -376,8 +376,20 @@ export function repairCodexBundledPlugins(
     };
   }
 
+  let before: string;
+  try {
+    before = readFileSync(configPath, "utf8");
+  } catch {
+    before = "";
+  }
+
+  const configuredMarketplace = readMarketplaceTable(before, OPENAI_BUNDLED_MARKETPLACE_NAME);
+  const configuredSource = configuredMarketplace?.source_type === "local" ? configuredMarketplace.source : undefined;
+  const usableConfiguredSource = configuredSource && sourceResolvesToManifest(configuredSource)
+    ? configuredSource
+    : null;
   const locateCurrent = options.locateCurrent ?? (() => locateCurrentBundledMarketplace());
-  const currentBundledPath = locateCurrent();
+  const currentBundledPath = locateCurrent() ?? usableConfiguredSource;
   if (!currentBundledPath) {
     return {
       ok: false,
@@ -386,13 +398,6 @@ export function repairCodexBundledPlugins(
       message: `Could not locate the installed Codex ${OPENAI_BUNDLED_MARKETPLACE_NAME} marketplace.`,
       diagnostic,
     };
-  }
-
-  let before: string;
-  try {
-    before = readFileSync(configPath, "utf8");
-  } catch {
-    before = "";
   }
 
   let after = replaceOrAppendTable(before, marketplaceHeaderRegex(OPENAI_BUNDLED_MARKETPLACE_NAME), marketplaceTable(currentBundledPath));

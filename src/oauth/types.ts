@@ -1,10 +1,15 @@
 /** Minimal OAuth types, ported from jawcode packages/ai/src/utils/oauth/types.ts. */
+export type OAuthCredentialSource = "oauth" | "local-cli" | "credential-file" | "environment" | "manual";
+
 export type OAuthCredentials = {
   refresh: string;
   access: string;
   expires: number; // epoch ms (already skew-adjusted by the provider flow)
   email?: string;
   accountId?: string;
+  source?: OAuthCredentialSource;
+  /** Google Antigravity (Cloud Code Assist) discovered project id; injected into the CCA envelope. */
+  projectId?: string;
 };
 
 export interface OAuthController {

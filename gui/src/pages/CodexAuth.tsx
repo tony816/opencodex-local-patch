@@ -3,17 +3,10 @@ import { useT, type TFn } from "../i18n";
 import { IconLock, IconPlus, IconX, IconAlert, IconRefresh, IconTicket } from "../icons";
 import { Notice } from "../ui";
 import AddCodexAccountModal from "../components/AddCodexAccountModal";
+import { type AccountQuota, normalizeQuotaForPlan } from "../codex-quota-utils";
 
-interface AccountQuota {
-  weeklyPercent?: number;
-  fiveHourPercent?: number;
-  monthlyPercent?: number;
-  weeklyResetAt?: number;
-  fiveHourResetAt?: number;
-  monthlyResetAt?: number;
-  resetCredits?: number;
-  updatedAt: number;
-}
+export { normalizeQuotaForPlan, isThirtyDayOnlyPlan } from "../codex-quota-utils";
+export type { AccountQuota } from "../codex-quota-utils";
 interface AccountEntry {
   id: string; email: string; plan?: string; isMain: boolean;
   hasCredential: boolean; quota: AccountQuota | null;
@@ -58,7 +51,7 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
     });
     setActiveId(id);
     setConfirm(null);
-    const label = id ? accounts.find(a => a.id === id)?.email ?? id : "main";
+    const label = id && id !== "__main__" ? accounts.find(a => a.id === id)?.email ?? id : "main";
     setToast(t("codexAuth.switched", { email: label }));
     setTimeout(() => setToast(""), 5000);
   };
@@ -141,6 +134,9 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
   const main = accounts.find(a => a.isMain);
   const pool = accounts.filter(a => !a.isMain);
   const isNext = (id: string) => activeId === id;
+  // Main is the active/next account when no pool account is selected (legacy null) or when
+  // it is explicitly set to the rotation id "__main__".
+  const isMainActive = !activeId || activeId === "__main__";
 
   return (
     <div>
@@ -153,20 +149,22 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
 
       {toast && <Notice tone="ok">{toast}</Notice>}
 
-      <div className={`card ${!activeId ? "card-active" : ""}`}
-        onClick={() => activeId ? setConfirm({ id: "__main__", email: main?.email ?? "Codex App", plan: main?.plan, isMain: true, hasCredential: true, quota: main?.quota ?? null }) : undefined}
-        style={{ cursor: activeId ? "pointer" : "default", marginBottom: 12 }}>
+      <div className={`card ${isMainActive ? "card-active" : ""}`}
+        onClick={() => !isMainActive ? setConfirm({ id: "__main__", email: main?.email ?? "Codex App", plan: main?.plan, isMain: true, hasCredential: true, quota: main?.quota ?? null }) : undefined}
+        style={{ cursor: isMainActive ? "default" : "pointer", marginBottom: 12 }}>
         <div className="card-head">
           <span className="dot dot-green" />
           <strong>{t("codexAuth.mainAccount")}</strong>
-          {main && <TicketBadge account={{ ...main, id: "__main__" } as AccountEntry} onClick={() => !isWorkspaceAccount(main?.plan) && openResetPopup({ ...main, id: "__main__" } as AccountEntry)} />}
-          <span className={`badge ${!activeId ? "badge-primary" : "badge-muted"}`}>
-            {!activeId ? t("codexAuth.nextSession") : t("codexAuth.current")}
+          <span className="card-badges">
+            {main && <TicketBadge account={{ ...main, id: "__main__" } as AccountEntry} onClick={() => openResetPopup({ ...main, id: "__main__" } as AccountEntry)} />}
+            <span className={`badge ${isMainActive ? "badge-primary" : "badge-muted"}`}>
+              {isMainActive ? t("codexAuth.nextSession") : t("codexAuth.current")}
+            </span>
           </span>
           <span className="card-right"><IconLock width={14} /> {t("codexAuth.appLogin")}</span>
         </div>
         <div className="card-sub">{main?.email ?? "Codex App login"}{main?.plan ? ` · ${main.plan}` : ""}</div>
-        {main?.quota && <QuotaBars quota={main.quota} threshold={autoThreshold} t={t} />}
+        {main?.quota && <QuotaBars quota={main.quota} plan={main.plan} threshold={autoThreshold} t={t} />}
       </div>
 
       <div className="section-sep">
@@ -185,10 +183,12 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
           <div className="card-head">
             <span className={`dot ${a.needsReauth ? "dot-amber" : isNext(a.id) ? "dot-blue" : "dot-muted"}`} />
             <strong>{a.email}</strong>
-            {a.plan && <span className="badge badge-green">{a.plan}</span>}
-            <TicketBadge account={a} onClick={() => !isWorkspaceAccount(a.plan) && openResetPopup(a)} />
-            {a.needsReauth && <span className="badge badge-amber">{t("codexAuth.needsReauth")}</span>}
-            {isNext(a.id) && !a.needsReauth && <span className="badge badge-primary">{t("codexAuth.nextSession")}</span>}
+            <span className="card-badges">
+              {a.plan && <span className="badge badge-green">{a.plan}</span>}
+              <TicketBadge account={a} onClick={() => openResetPopup(a)} />
+              {a.needsReauth && <span className="badge badge-amber">{t("codexAuth.needsReauth")}</span>}
+              {isNext(a.id) && !a.needsReauth && <span className="badge badge-primary">{t("codexAuth.nextSession")}</span>}
+            </span>
             <button
               className="btn-icon btn-icon-danger card-right"
               aria-label={t("common.remove")}
@@ -199,7 +199,7 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
           </div>
           {a.needsReauth
             ? <div className="card-sub faint">{t("codexAuth.tokenExpired")}</div>
-            : <QuotaBars quota={a.quota} threshold={autoThreshold} t={t} />}
+            : <QuotaBars quota={a.quota} plan={a.plan} threshold={autoThreshold} t={t} />}
         </div>
       ))}
 
@@ -229,7 +229,7 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
             )}
             <div className="modal-actions">
               <button className="btn btn-ghost" onClick={() => setConfirm(null)}>{t("codexAuth.cancel")}</button>
-              <button className="btn btn-primary" onClick={() => setActive(confirm.id === "__main__" ? null : confirm.id)}>
+              <button className="btn btn-primary" onClick={() => setActive(confirm.id === "__main__" ? "__main__" : confirm.id)}>
                 {t("codexAuth.setAsNext")}
               </button>
             </div>
@@ -306,19 +306,21 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
   );
 }
 
-function QuotaBars({ quota, threshold, t }: { quota: AccountQuota | null; threshold: number; t: TFn }) {
-  if (!quota) return null;
-  const hasFiveHour = typeof quota.fiveHourPercent === "number";
-  const hasWeekly = typeof quota.weeklyPercent === "number";
-  const hasMonthly = typeof quota.monthlyPercent === "number";
+
+function QuotaBars({ quota, plan, threshold, t }: { quota: AccountQuota | null; plan?: string; threshold: number; t: TFn }) {
+  const displayQuota = normalizeQuotaForPlan(quota, plan);
+  if (!displayQuota) return null;
+  const hasFiveHour = typeof displayQuota.fiveHourPercent === "number";
+  const hasWeekly = typeof displayQuota.weeklyPercent === "number";
+  const hasMonthly = typeof displayQuota.monthlyPercent === "number";
   if (!hasFiveHour && !hasWeekly && !hasMonthly) return null;
   return (
     <div className="quota-compact">
       {hasFiveHour && (
         <QuotaRow
           label={t("codexAuth.fiveHour")}
-          percent={quota.fiveHourPercent!}
-          resetAt={quota.fiveHourResetAt}
+          percent={displayQuota.fiveHourPercent!}
+          resetAt={displayQuota.fiveHourResetAt}
           threshold={threshold}
           t={t}
         />
@@ -326,8 +328,8 @@ function QuotaBars({ quota, threshold, t }: { quota: AccountQuota | null; thresh
       {hasWeekly && (
         <QuotaRow
           label={t("codexAuth.weekly")}
-          percent={quota.weeklyPercent!}
-          resetAt={quota.weeklyResetAt}
+          percent={displayQuota.weeklyPercent!}
+          resetAt={displayQuota.weeklyResetAt}
           threshold={threshold}
           t={t}
         />
@@ -335,8 +337,8 @@ function QuotaBars({ quota, threshold, t }: { quota: AccountQuota | null; thresh
       {hasMonthly && (
         <QuotaRow
           label={t("codexAuth.monthly")}
-          percent={quota.monthlyPercent!}
-          resetAt={quota.monthlyResetAt}
+          percent={displayQuota.monthlyPercent!}
+          resetAt={displayQuota.monthlyResetAt}
           threshold={threshold}
           t={t}
         />
@@ -391,27 +393,18 @@ function CreditItem({ index, grantedAt, expiresAt, isNext, t }: {
   );
 }
 
-function isWorkspaceAccount(plan?: string): boolean {
-  if (!plan) return false;
-  return ["team", "business", "enterprise", "edu",
-    "self_serve_business_usage_based", "enterprise_cbp_usage_based",
-    "hc", "education"].includes(plan.toLowerCase());
-}
-
 function TicketBadge({ account, onClick }: { account: AccountEntry; onClick: () => void }) {
   const credits = account.quota?.resetCredits;
-  const workspace = isWorkspaceAccount(account.plan);
-  if (!workspace && credits === undefined) return null;
-  const hasCredits = typeof credits === "number" && credits > 0 && !workspace;
+  if (credits === undefined) return null;
+  const hasCredits = typeof credits === "number" && credits > 0;
   return (
     <button type="button"
-      className={`badge ${hasCredits ? "badge-amber" : "badge-muted"} ${workspace ? "badge-disabled" : "badge-clickable"}`}
-      onClick={workspace ? undefined : (e) => { e.stopPropagation(); onClick(); }}
-      disabled={workspace}
-      aria-label={workspace ? "Not available for workspace accounts" : `${credits ?? 0} reset credit(s)`}
+      className={`badge ${hasCredits ? "badge-amber" : "badge-muted"} badge-clickable`}
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      aria-label={`${credits} reset credit(s)`}
     >
       <IconTicket width={12} />
-      {workspace ? "–" : (credits ?? 0)}
+      {credits}
     </button>
   );
 }

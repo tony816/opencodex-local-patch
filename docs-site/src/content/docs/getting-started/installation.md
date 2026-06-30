@@ -10,18 +10,14 @@ sends your traffic anywhere except the provider you configure.
 
 | Requirement | Why |
 | --- | --- |
-| **[Bun](https://bun.sh) ≥ 1.1** (recommended) or **Node ≥ 20** | `ocx` runs on the Bun runtime; the service runner invokes `bun`. |
+| **[Node](https://nodejs.org) ≥ 18** | `ocx` runs on the Bun runtime, but the runtime is bundled automatically on `npm install` — you do **not** need to install Bun yourself. |
 | **[OpenAI Codex](https://openai.com/codex)** (CLI, App, or SDK) | The client opencodex sits in front of. opencodex writes to `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`). |
 | A provider account or API key | Anthropic, xAI, Kimi, Ollama Cloud, OpenRouter, an OpenAI-compatible endpoint, or your ChatGPT login. |
 
 ## Install
 
 ```bash
-# With npm (recommended)
 npm install -g @bitkyc08/opencodex
-
-# With Bun
-bun install -g @bitkyc08/opencodex
 ```
 
 Verify the binary is on your `PATH`:
@@ -40,6 +36,9 @@ cd opencodex
 bun install
 bun run dev      # starts the proxy in dev mode (src/cli.ts start)
 ```
+
+`bun run dev` starts the proxy API only (`/healthz`, `/v1/responses`, `/api/*`). It does not
+serve the packaged dashboard at `/`.
 
 The web dashboard lives in `gui/` and runs separately:
 

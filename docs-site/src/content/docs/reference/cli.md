@@ -3,7 +3,9 @@ title: CLI Reference
 description: Every ocx command and flag.
 ---
 
-The opencodex CLI is `ocx`. Run `ocx help` (or `--help` / `-h`) for usage.
+The opencodex CLI is `ocx`. Run `ocx help` (or `--help` / `-h`) for top-level usage.
+Run `ocx help <command>` for command-specific help. Help and version commands are read-only and do
+not start, stop, install, uninstall, or rewrite Codex/opencodex state.
 
 ## Setup & lifecycle
 
@@ -39,6 +41,52 @@ catalog entries so plain `codex` works natively again. `eject` is an alias of `r
 
 Print a read-only diagnostic summary: proxy PID, `/healthz` reachability, dashboard URL,
 config path, default provider, Codex autostart setting, service state, and shim state.
+
+Use `--json` for a machine-readable, read-only diagnostics contract:
+
+```bash
+ocx status --json
+```
+
+Example shape:
+
+```json
+{
+  "schemaVersion": 1,
+  "proxy": {
+    "running": false,
+    "pid": null,
+    "health": {
+      "ok": false,
+      "url": "http://127.0.0.1:10100/healthz",
+      "message": "unreachable"
+    }
+  },
+  "dashboard": {
+    "url": "http://localhost:10100/"
+  },
+  "paths": {
+    "config": "/Users/example/.opencodex/config.json",
+    "pid": "/Users/example/.opencodex/ocx.pid",
+    "runtime": "/path/to/bun"
+  },
+  "runtime": {
+    "source": "bundled"
+  },
+  "codexAutostart": true,
+  "defaultProvider": "openai",
+  "service": {
+    "summary": "not installed (logs: /Users/example/.opencodex/service.log)"
+  },
+  "codexShim": {
+    "summary": "Codex autostart shim: not installed"
+  }
+}
+```
+
+The JSON schema is additive-only: future versions may add fields, but existing fields should stay
+stable. It intentionally excludes API keys, OAuth tokens, authorization headers, request content,
+emails, and account identities.
 
 ## Models & Codex
 
@@ -83,7 +131,8 @@ Windows **Task Scheduler**) that auto-starts on login and auto-restarts on crash
 | `start` | Start an installed service. |
 | `stop` | Stop the service and restore native Codex. |
 | `status` | Report whether the service is running. |
-| `uninstall` | Remove the service and restore native Codex. (alias: `remove`) |
+| `uninstall` | Remove the service and restore native Codex. |
+| `remove` | Alias of `uninstall`. |
 
 ```bash
 ocx service install
@@ -93,8 +142,8 @@ ocx service uninstall
 
 ### `ocx codex-shim <subcommand>`
 
-Replace the `codex` binary on PATH with a lightweight wrapper script that auto-starts the opencodex
-proxy whenever `codex` is launched. The original binary is backed up and restored on uninstall.
+Wrap a script-based `codex` launcher on PATH with a lightweight autostart script. Real `codex.exe`
+targets are left untouched to avoid breaking exact executable invocations.
 
 If Codex is updated and overwrites the wrapper, the shim auto-repairs on the next `install` call —
 the new binary is backed up and a fresh wrapper is written.
@@ -103,6 +152,7 @@ the new binary is backed up and a fresh wrapper is written.
 | --- | --- |
 | `install` | Install the shim (or repair if stale). |
 | `uninstall` | Remove the shim and restore the original Codex binary. |
+| `remove` | Alias of `uninstall`. |
 | `status` | Report shim state (installed / stale / missing). |
 
 ```bash
@@ -120,13 +170,14 @@ lightweight, on-demand startup without a daemon — the proxy starts only when `
 
 ### `ocx update`
 
-Self-update opencodex to the latest version published on npm, using the package manager it was
-installed with (`bun install -g @bitkyc08/opencodex@latest` or `npm install -g @bitkyc08/opencodex@latest`). It detects a
-source checkout and tells you to `git pull && bun install` instead, and is a no-op if you're already
-on the newest version. Restart the proxy afterward (`ocx stop && ocx start`) to run the new build.
+Self-update opencodex from npm. Stable installs use `@latest`; preview installs stay on `@preview`
+unless you pass `--tag latest|preview`. It detects a source checkout and tells you to
+`git pull && bun install` instead, and is a no-op if you're already on the newest version for that
+tag. Restart the proxy afterward (`ocx stop && ocx start`) to run the new build.
 
 ```bash
 ocx update
+ocx update --tag preview
 ```
 
 New versions become available the moment the [Release workflow](https://github.com/lidge-jun/opencodex/actions/workflows/release.yml)
@@ -134,8 +185,13 @@ publishes them to npm.
 
 ## Help
 
-`ocx help`, `ocx --help`, `ocx -h` — print usage and examples.
+`ocx help`, `ocx --help`, `ocx -h` — print top-level usage and examples.
 
-:::note
-`ocx gui` works but is omitted from the short `ocx help` listing.
-:::
+`ocx help <command>`, `ocx <command> --help`, `ocx <command> -h` — print command-specific usage.
+
+Unknown commands remain errors even when a help flag is present, so scripts can rely on the exit
+code instead of scraping text.
+
+## Version
+
+`ocx --version`, `ocx -v`, `ocx version` — print a single script-friendly version line and exit.

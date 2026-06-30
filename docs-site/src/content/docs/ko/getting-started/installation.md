@@ -10,18 +10,14 @@ opencodex는 단일 CLI인 `ocx`로 제공됩니다. 작은 로컬 HTTP 서버(B
 
 | 요구 사항 | 이유 |
 | --- | --- |
-| **[Bun](https://bun.sh) ≥ 1.1**(권장) 또는 **Node ≥ 20** | `ocx`는 Bun 런타임에서 실행되며, 서비스 러너가 `bun`을 호출합니다. |
+| **[Node](https://nodejs.org) ≥ 18** | `ocx`는 Bun 런타임에서 실행되지만, 런타임이 `npm install` 시 자동으로 번들되므로 Bun을 직접 설치할 필요가 **없습니다**. |
 | **[OpenAI Codex](https://openai.com/codex)**(CLI, App, 또는 SDK) | opencodex가 앞단에 위치하는 클라이언트입니다. opencodex는 `$CODEX_HOME/config.toml`(기본값 `~/.codex/config.toml`)에 기록합니다. |
 | 프로바이더 계정 또는 API 키 | Anthropic, xAI, Kimi, Ollama Cloud, OpenRouter, OpenAI 호환 엔드포인트, 또는 ChatGPT 로그인. |
 
 ## 설치
 
 ```bash
-# With npm (recommended)
 npm install -g @bitkyc08/opencodex
-
-# With Bun
-bun install -g @bitkyc08/opencodex
 ```
 
 바이너리가 `PATH`에 있는지 확인합니다:
@@ -40,6 +36,9 @@ cd opencodex
 bun install
 bun run dev      # starts the proxy in dev mode (src/cli.ts start)
 ```
+
+`bun run dev`는 프록시 API(`/healthz`, `/v1/responses`, `/api/*`)만 시작합니다. 패키징된
+대시보드 `/`를 함께 서빙하지 않습니다.
 
 웹 대시보드는 `gui/`에 있으며 별도로 실행됩니다:
 

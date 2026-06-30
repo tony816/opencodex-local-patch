@@ -1,9 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
-import { getCodexAccountCredential, listCodexAccountIds } from "./codex-account-store";
+import { getCodexAccountCredential } from "./codex-account-store";
 import { loadConfig } from "./config";
-import { extractAccountId, extractEmail } from "./oauth/chatgpt";
+import { extractAccountId } from "./oauth/chatgpt";
 
 export function readCodexTokens(): { access_token: string; account_id: string; id_token?: string } | null {
   try {
@@ -28,38 +28,36 @@ export function getMainChatgptAccountId(): string | null {
   return extractAccountId(tokens.id_token, tokens.access_token) ?? (tokens.account_id || null);
 }
 
-function getMainChatgptEmail(): string | null {
-  const tokens = readCodexTokens();
-  if (!tokens) return null;
-  return extractEmail(tokens.id_token, tokens.access_token) ?? null;
-}
-
 function normalizedEmail(email: string | undefined | null): string | null {
   const trimmed = email?.trim().toLowerCase();
   return trimmed || null;
 }
 
-function poolEmailForId(id: string): string | null {
-  const account = (loadConfig().codexAccounts ?? []).find(a => a.id === id);
-  return normalizedEmail(account?.email);
+function isWorkspacePlan(plan: string | undefined | null): boolean {
+  return !!plan && /team|business|enterprise|workspace|edu/i.test(plan);
 }
 
-// Business/Team members can share chatgpt_account_id, so require email match too.
+// Personal and workspace subscriptions are separate duplicate buckets.
+// Within each bucket, keep the original ChatGPT account id + email collision guard.
 export function checkAccountIdCollision(
   chatgptAccountId: string,
   email?: string | null,
+  plan?: string | null,
 ): { collision: true; reason: string } | { collision: false } {
-  const candidateEmail = normalizedEmail(email);
-  const mainId = getMainChatgptAccountId();
-  const mainEmail = getMainChatgptEmail();
-  if (mainId && mainId === chatgptAccountId && (!candidateEmail || !mainEmail || mainEmail === candidateEmail)) {
-    return { collision: true, reason: "This account is your main Codex login. Use a different account for the pool." };
+  const mainAccountId = getMainChatgptAccountId();
+  if (mainAccountId && mainAccountId === chatgptAccountId) {
+    return { collision: true, reason: "Account is already used by the main Codex login." };
   }
-  for (const poolId of listCodexAccountIds()) {
-    const cred = getCodexAccountCredential(poolId);
-    const poolEmail = poolEmailForId(poolId);
+
+  const candidateEmail = normalizedEmail(email);
+  const candidateWorkspace = isWorkspacePlan(plan);
+  for (const account of loadConfig().codexAccounts ?? []) {
+    if (account.isMain) continue;
+    if (isWorkspacePlan(account.plan) !== candidateWorkspace) continue;
+    const cred = getCodexAccountCredential(account.id);
+    const poolEmail = normalizedEmail(account.email);
     if (cred && cred.chatgptAccountId === chatgptAccountId && (!candidateEmail || !poolEmail || poolEmail === candidateEmail)) {
-      return { collision: true, reason: `Account is already in the pool (${poolId}).` };
+      return { collision: true, reason: `Account is already in the pool (${account.id}).` };
     }
   }
   return { collision: false };

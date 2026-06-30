@@ -10,6 +10,7 @@ import type { OcxConfig, OcxProviderConfig } from "./types";
 import { CODEX_REASONING_LEVELS, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts } from "./reasoning-effort";
 import { getJawcodeModelMetadata, getJawcodeModelMetadataCaseInsensitive, listJawcodeModelMetadata, resolveJawcodeProvider } from "./generated/jawcode-model-metadata";
 import { shouldCaseFoldMetadataModelId } from "./providers/derive";
+import { applyProviderContextCap, providerContextCap } from "./provider-context-cap";
 
 const BUNDLED_CATALOG_CACHE_MS = 60_000;
 let bundledCatalogCache: { expiresAt: number; value: RawCatalog | null } | null = null;
@@ -36,26 +37,61 @@ function isDefaultCatalogPath(path: string): boolean {
 
 /**
  * Native OpenAI / Codex models served via ChatGPT OAuth passthrough — FALLBACK only. The ChatGPT
- * backend has no `GET /models`, so the real set is read from the live Codex catalog (the slugs Codex
- * itself ships for the installed version) via nativeOpenAiSlugs(); this static list is used only when
- * no catalog is present. Keep it to ids ChatGPT actually accepts — advertising a phantom (e.g. an
- * old `gpt-5.2`/`gpt-5.3-codex` that a newer Codex dropped) makes it 400 "model is not supported".
+ * backend has no `GET /models`, so the real set is read from the live Codex catalog via
+ * nativeOpenAiSlugs(); this static list is used when no catalog is present, plus selected documented
+ * Codex-native additions that may lag in a user's installed Codex catalog.
  */
 export const NATIVE_OPENAI_MODELS = [
   "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
 ];
 
+const DOCUMENTED_NATIVE_OPENAI_ADDITIONS = ["gpt-5.3-codex-spark"];
+
+/**
+ * The ONLY native OpenAI/Codex slugs opencodex advertises. A user's installed Codex ships extra
+ * native models in its live catalog (e.g. `gpt-5.2`, `gpt-5.3-codex`, `codex-auto-review`); those
+ * are legacy/internal and must never surface in `/v1/models` or the subagent picker. Live-catalog
+ * native slugs are filtered against this allowlist so only the supported set is exposed.
+ */
+const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
+
+/**
+ * True when a bare slug is an OpenAI/Codex-family native that opencodex does NOT support
+ * (legacy/internal like `gpt-5.2`, `gpt-5.3-codex`, `codex-auto-review`). Used to drop these
+ * from the ON-DISK catalog so the Codex file picker matches the live `/v1/models` filter,
+ * WITHOUT removing genuine user-added natives (non gpt-/codex- slugs are preserved).
+ */
+function isUnsupportedOpenAiNativeSlug(slug: string): boolean {
+  if (slug.includes("/")) return false;
+  if (SUPPORTED_NATIVE_OPENAI_SLUGS.has(slug)) return false;
+  return /^(?:gpt|codex)-/.test(slug);
+}
+
+const NATIVE_OPENAI_CONTEXT_OVERRIDES: Record<string, { contextWindow?: number; maxContextWindow?: number }> = {
+  "gpt-5.5": { contextWindow: 272_000, maxContextWindow: 272_000 },
+  "gpt-5.4": { maxContextWindow: 1_000_000 },
+};
+
 /**
  * The native (passthrough) OpenAI slugs to advertise — the LIVE Codex catalog's own bare slugs when
- * available (always-latest: matches exactly what the installed Codex supports), else the static
- * fallback above. Single source for the /v1/models native list and the subagent-default seed.
+ * available, with documented Codex-native additions layered in, else the static fallback above.
+ * Single source for the /v1/models native list and the subagent-default seed.
  */
 export function nativeOpenAiSlugs(): string[] {
   const live = listCatalogNativeSlugs();
-  return live.length > 0 ? live : NATIVE_OPENAI_MODELS;
+  return live.length > 0 ? unique([...live, ...DOCUMENTED_NATIVE_OPENAI_ADDITIONS]) : NATIVE_OPENAI_MODELS;
 }
 
-export interface CatalogModel { id: string; provider: string; owned_by?: string; reasoningEfforts?: string[]; contextWindow?: number; inputModalities?: string[]; }
+export interface CatalogModel {
+  id: string;
+  provider: string;
+  owned_by?: string;
+  reasoningEfforts?: string[];
+  contextWindow?: number;
+  contextCap?: number;
+  contextCapped?: boolean;
+  inputModalities?: string[];
+}
 type RawEntry = Record<string, unknown>;
 type RawCatalog = { models?: RawEntry[]; [k: string]: unknown };
 const JAWCODE_CATALOG_AUGMENT_PROVIDERS = new Set(["opencode-go"]);
@@ -142,6 +178,23 @@ function ensureAutoCompactTokenLimit(entry: RawEntry): RawEntry {
   return entry;
 }
 
+function isNativeOpenAiEntry(entry: RawEntry): boolean {
+  return typeof entry.slug === "string" && !entry.slug.includes("/");
+}
+
+function applyNativeOpenAiContextOverride(entry: RawEntry): void {
+  if (!isNativeOpenAiEntry(entry)) return;
+  const override = NATIVE_OPENAI_CONTEXT_OVERRIDES[entry.slug as string];
+  if (!override) return;
+  if (typeof override.contextWindow === "number") {
+    entry.context_window = override.contextWindow;
+    entry.auto_compact_token_limit = Math.floor(override.contextWindow * 0.9);
+  }
+  if (typeof override.maxContextWindow === "number") {
+    entry.max_context_window = override.maxContextWindow;
+  }
+}
+
 function ensureStrictCatalogFields(entry: RawEntry): RawEntry {
   if (typeof entry.supports_reasoning_summaries !== "boolean") entry.supports_reasoning_summaries = true;
   if (typeof entry.default_reasoning_summary !== "string") entry.default_reasoning_summary = "none";
@@ -160,7 +213,7 @@ function ensureStrictCatalogFields(entry: RawEntry): RawEntry {
   if (
     typeof entry.max_context_window !== "number"
     || entry.max_context_window <= 0
-    || entry.max_context_window > contextWindow
+    || (!isNativeOpenAiEntry(entry) && entry.max_context_window > contextWindow)
   ) {
     entry.max_context_window = contextWindow;
   }
@@ -187,7 +240,7 @@ export function normalizeRoutedCatalogEntry(entry: RawEntry): RawEntry {
   return ensureStrictCatalogFields(entry);
 }
 
-function applyJawcodeCatalogMetadata(entry: RawEntry, slug: string): void {
+function applyJawcodeCatalogMetadata(entry: RawEntry, slug: string, contextCap?: number): void {
   const slash = slug.indexOf("/");
   if (slash < 0) return;
   const provider = slug.slice(0, slash);
@@ -198,9 +251,10 @@ function applyJawcodeCatalogMetadata(entry: RawEntry, slug: string): void {
     ?? (shouldCaseFoldMetadataModelId(provider) ? getJawcodeModelMetadataCaseInsensitive(jawcodeProvider, modelId) : undefined);
   if (!meta) return;
   if (typeof meta.contextWindow === "number" && meta.contextWindow > 0) {
-    entry.context_window = meta.contextWindow;
-    entry.max_context_window = meta.contextWindow;
-    entry.auto_compact_token_limit = Math.floor(meta.contextWindow * 0.9);
+    const contextWindow = applyProviderContextCap(meta.contextWindow, contextCap) ?? meta.contextWindow;
+    entry.context_window = contextWindow;
+    entry.max_context_window = contextWindow;
+    entry.auto_compact_token_limit = Math.floor(contextWindow * 0.9);
   }
   if (Array.isArray(meta.input) && meta.input.length > 0) {
     entry.input_modalities = meta.input;
@@ -311,7 +365,7 @@ function loadCatalogForSync(path: string): RawCatalog | null {
   const catalog = readCatalog(path);
   if (catalog && findNativeTemplate(catalog)) return catalog;
   return readCatalog(catalogBackupPathFor(path))
-    ?? readCatalog(legacyCatalogBackupPath())
+    ?? (isDefaultCatalogPath(path) ? readCatalog(legacyCatalogBackupPath()) : null)
     ?? readCatalog(CODEX_MODELS_CACHE_PATH)
     ?? materializeBundledCodexCatalog(path)
     ?? catalog;
@@ -332,8 +386,7 @@ function readCurrentCatalogOrCache(): RawCatalog | null {
 export function loadCatalogTemplate(): RawEntry | null {
   const catalogPath = readCodexCatalogPath();
   const native = findNativeTemplate(readCatalog(catalogPath))
-    ?? findNativeTemplate(readCatalog(catalogBackupPathFor(catalogPath)))
-    ?? findNativeTemplate(readCatalog(legacyCatalogBackupPath()))
+    ?? findNativeTemplate(readCatalogBackup(catalogPath))
     ?? findNativeTemplate(readCatalog(CODEX_MODELS_CACHE_PATH))
     ?? findNativeTemplate(loadBundledCodexCatalog());
   return native ? JSON.parse(JSON.stringify(native)) : null;
@@ -397,8 +450,10 @@ function deriveEntry(template: RawEntry | null, slug: string, desc: string, prio
       }
       applyReasoningLevels(e, model?.reasoningEfforts);
       normalizeRoutedCatalogEntry(e);
-      applyJawcodeCatalogMetadata(e, slug);
+      applyJawcodeCatalogMetadata(e, slug, model?.contextCap);
       applyCatalogModelMetadata(e, model);
+    } else {
+      applyNativeOpenAiContextOverride(e);
     }
     return ensureStrictCatalogFields(normalizeServiceTiers(e));
   }
@@ -411,8 +466,9 @@ function deriveEntry(template: RawEntry | null, slug: string, desc: string, prio
   };
   if (slug.includes("/")) applyReasoningLevels(entry, model?.reasoningEfforts);
   else applyReasoningLevels(entry);
-  applyJawcodeCatalogMetadata(entry, slug);
+  applyJawcodeCatalogMetadata(entry, slug, model?.contextCap);
   applyCatalogModelMetadata(entry, model);
+  applyNativeOpenAiContextOverride(entry);
   return ensureStrictCatalogFields(normalizeServiceTiers(entry));
 }
 
@@ -452,8 +508,18 @@ export function buildCatalogEntries(template: RawEntry | null, gptSlugs: string[
 /** Bare picker-visible native slugs in the live Codex catalog (drives the subagent picker UI). */
 export function listCatalogNativeSlugs(): string[] {
   const cat = readCurrentCatalogOrCache();
-  return (cat?.models ?? [])
-    .filter(m => typeof m.slug === "string" && !(m.slug as string).includes("/") && m.visibility === "list")
+  return filterSupportedNativeSlugs(cat?.models ?? []);
+}
+
+/**
+ * Keep only picker-visible, bare (non-routed) native slugs that opencodex actually supports.
+ * A user's installed Codex may list legacy/internal natives (`gpt-5.2`, `gpt-5.3-codex`,
+ * `codex-auto-review`, …); the allowlist drops them so `/v1/models` and the subagent picker
+ * never advertise an unsupported native. Exported for regression coverage.
+ */
+export function filterSupportedNativeSlugs(models: RawEntry[]): string[] {
+  return models
+    .filter(m => typeof m.slug === "string" && !(m.slug as string).includes("/") && m.visibility === "list" && SUPPORTED_NATIVE_OPENAI_SLUGS.has(m.slug as string))
     .map(m => m.slug as string);
 }
 
@@ -463,7 +529,8 @@ export function listCatalogNativeSlugs(): string[] {
  * (rather than the modified value left in the live catalog by a previous sync).
  */
 function readCatalogBackup(catalogPath: string): RawCatalog | null {
-  return readCatalog(catalogBackupPathFor(catalogPath)) ?? readCatalog(legacyCatalogBackupPath());
+  return readCatalog(catalogBackupPathFor(catalogPath))
+    ?? (isDefaultCatalogPath(catalogPath) ? readCatalog(legacyCatalogBackupPath()) : null);
 }
 
 function catalogHasRoutedEntries(catalog: RawCatalog | null): boolean {
@@ -486,7 +553,7 @@ function ensureCatalogBackup(catalogPath: string, catalog: RawCatalog): void {
   const dir = getConfigDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writePristineCatalogBackup(catalogBackupPathFor(catalogPath), catalogPath, catalog);
-  writePristineCatalogBackup(legacyCatalogBackupPath(), catalogPath, catalog);
+  if (isDefaultCatalogPath(catalogPath)) writePristineCatalogBackup(legacyCatalogBackupPath(), catalogPath, catalog);
 }
 
 function readNativeBaseline(catalogPath: string): Map<string, number> {
@@ -521,33 +588,38 @@ function configuredInputModalities(prov: OcxProviderConfig, id: string): string[
   return Array.isArray(modalities) && modalities.length > 0 ? [...modalities] : undefined;
 }
 
-function applyProviderConfigHints(name: string, prov: OcxProviderConfig, model: CatalogModel): CatalogModel {
+function applyProviderConfigHints(name: string, prov: OcxProviderConfig, model: CatalogModel, providerCap?: number): CatalogModel {
   void name;
-  const contextCap = configuredContextWindow(prov, model.id);
+  const configuredCap = configuredContextWindow(prov, model.id);
   const inputModalities = configuredInputModalities(prov, model.id);
   const reasoningEfforts = configuredReasoningEfforts(prov, model.id);
-  return {
+  const hinted = {
     ...model,
-    ...(contextCap !== undefined
+    ...(configuredCap !== undefined
       ? {
         contextWindow: typeof model.contextWindow === "number" && model.contextWindow > 0
-          ? Math.min(model.contextWindow, contextCap)
-          : contextCap,
+          ? Math.min(model.contextWindow, configuredCap)
+          : configuredCap,
       }
       : {}),
     ...(inputModalities ? { inputModalities } : {}),
     ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
   };
+  const capped = applyProviderContextCap(hinted.contextWindow, providerCap);
+  if (providerCap !== undefined && capped !== hinted.contextWindow) {
+    return { ...hinted, contextWindow: capped, contextCap: providerCap, contextCapped: true };
+  }
+  return providerCap !== undefined ? { ...hinted, contextCap: providerCap, contextCapped: false } : hinted;
 }
 
-function catalogHintsFromProviderConfig(name: string, prov: OcxProviderConfig, id: string): Partial<CatalogModel> {
-  const hinted = applyProviderConfigHints(name, prov, { id, provider: name });
+function catalogHintsFromProviderConfig(name: string, prov: OcxProviderConfig, id: string, contextCap?: number): Partial<CatalogModel> {
+  const hinted = applyProviderConfigHints(name, prov, { id, provider: name }, contextCap);
   const { provider: _provider, id: _id, ...hints } = hinted;
   return hints;
 }
 
-function applyConfigHintsToCachedModels(name: string, prov: OcxProviderConfig, models: CatalogModel[]): CatalogModel[] {
-  return models.map(model => applyProviderConfigHints(name, prov, model));
+function applyConfigHintsToCachedModels(name: string, prov: OcxProviderConfig, models: CatalogModel[], contextCap?: number): CatalogModel[] {
+  return models.map(model => applyProviderConfigHints(name, prov, model, contextCap));
 }
 
 function isGlm52ModelId(id: string): boolean {
@@ -585,26 +657,26 @@ function catalogHintsFromModelsApiItem(providerName: string, item: ProviderModel
  * fetch failure → last-known-good cache (so a provider blip doesn't drop its models), else the
  * static config list. This is the per-provider half of jawcode's "always latest" resolver.
  */
-async function fetchProviderModels(name: string, prov: OcxProviderConfig, ttlMs: number): Promise<CatalogModel[]> {
+async function fetchProviderModels(name: string, prov: OcxProviderConfig, ttlMs: number, contextCap?: number): Promise<CatalogModel[]> {
   if (prov.authMode === "forward") return []; // ChatGPT backend has no /models
   const apiKey = await resolveModelsAuthToken(name, prov);
   if (prov.authMode === "oauth" && !apiKey) return []; // not logged in → skip
   const configured: CatalogModel[] = (prov.models ?? []).map(id => ({
     id,
     provider: name,
-    ...catalogHintsFromProviderConfig(name, prov, id),
+    ...catalogHintsFromProviderConfig(name, prov, id, contextCap),
   }));
   if (prov.liveModels === false) {
     return configured;
   }
   const fresh = getFreshCached(name, ttlMs);
-  if (fresh) return applyConfigHintsToCachedModels(name, prov, fresh); // dedups Codex's frequent /v1/models polling within the TTL
+  if (fresh) return applyConfigHintsToCachedModels(name, prov, fresh, contextCap); // dedups Codex's frequent /v1/models polling within the TTL
   const { url, headers } = buildModelsRequest(prov, apiKey);
   try {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
     if (!res.ok) {
       const stale = getStaleCached(name);
-      return stale ? applyConfigHintsToCachedModels(name, prov, stale) : configured;
+      return stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap) : configured;
     }
     const json = await res.json() as { data?: ProviderModelsApiItem[] };
     const live = (json.data ?? []).map(m => applyProviderConfigHints(name, prov, {
@@ -612,7 +684,7 @@ async function fetchProviderModels(name: string, prov: OcxProviderConfig, ttlMs:
       provider: name,
       owned_by: m.owned_by,
       ...catalogHintsFromModelsApiItem(name, m),
-    }));
+    }, contextCap));
     const liveIds = new Set(live.map(m => m.id));
     // Merge explicit config additions (e.g. a model not in the provider's /models, like a new endpoint).
     const merged = [...live, ...configured.filter(m => !liveIds.has(m.id))];
@@ -620,7 +692,7 @@ async function fetchProviderModels(name: string, prov: OcxProviderConfig, ttlMs:
     return merged;
   } catch {
     const stale = getStaleCached(name);
-    return stale ? applyConfigHintsToCachedModels(name, prov, stale) : configured;
+    return stale ? applyConfigHintsToCachedModels(name, prov, stale, contextCap) : configured;
   }
 }
 
@@ -632,10 +704,11 @@ async function fetchProviderModels(name: string, prov: OcxProviderConfig, ttlMs:
  */
 export async function gatherRoutedModels(config: OcxConfig): Promise<CatalogModel[]> {
   const ttlMs = config.modelCacheTtlMs ?? DEFAULT_MODEL_CACHE_TTL_MS;
+  const activeProviders = Object.entries(config.providers).filter(([, prov]) => prov.disabled !== true);
   const lists = await Promise.all(
-    Object.entries(config.providers).map(([name, prov]) => fetchProviderModels(name, prov, ttlMs)),
+    activeProviders.map(([name, prov]) => fetchProviderModels(name, prov, ttlMs, providerContextCap(config, name))),
   );
-  const all = augmentRoutedModelsWithJawcodeMetadata(lists.flat(), Object.keys(config.providers), config.providers)
+  const all = augmentRoutedModelsWithJawcodeMetadata(lists.flat(), activeProviders.map(([name]) => name), config.providers, config)
     // Drop image/video generation models (e.g. Grok image/video) — they are not usable by Codex and
     // must not surface in the dashboard, /v1/models, or the routed catalog. Single choke point.
     .filter(m => !isMediaGenerationModelId(m.id));
@@ -643,7 +716,12 @@ export async function gatherRoutedModels(config: OcxConfig): Promise<CatalogMode
   return all;
 }
 
-export function augmentRoutedModelsWithJawcodeMetadata(models: CatalogModel[], providerNames: string[], providers?: Record<string, OcxProviderConfig>): CatalogModel[] {
+export function augmentRoutedModelsWithJawcodeMetadata(
+  models: CatalogModel[],
+  providerNames: string[],
+  providers?: Record<string, OcxProviderConfig>,
+  caps?: Pick<OcxConfig, "providerContextCaps">,
+): CatalogModel[] {
   const out = [...models];
   const seen = new Set(out.map(m => `${m.provider}/${m.id}`));
   for (const provider of providerNames) {
@@ -655,7 +733,18 @@ export function augmentRoutedModelsWithJawcodeMetadata(models: CatalogModel[], p
       const key = `${provider}/${meta.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ provider, id: meta.id, owned_by: provider, ...(providers?.[provider] ? catalogHintsFromProviderConfig(provider, providers[provider], meta.id) : {}) });
+      const contextCap = caps ? providerContextCap(caps, provider) : undefined;
+      const model: CatalogModel = {
+        provider,
+        id: meta.id,
+        owned_by: provider,
+        ...(typeof meta.contextWindow === "number" && meta.contextWindow > 0 ? { contextWindow: meta.contextWindow } : {}),
+        ...(Array.isArray(meta.input) && meta.input.length > 0 ? { inputModalities: [...meta.input] } : {}),
+      };
+      out.push({
+        ...model,
+        ...(providers?.[provider] ? applyProviderConfigHints(provider, providers[provider], model, contextCap) : {}),
+      });
     }
   }
   return out;
@@ -695,7 +784,6 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{ added: num
   const template = findNativeTemplate(catalog);
 
   const goModels = await gatherRoutedModels(config);
-  if (goModels.length === 0) return { added: 0, path: catalogPath };
   try {
     // Once-only: preserve the PRISTINE pre-opencodex catalog as the native-priority baseline
     // (later syncs would otherwise overwrite it with featured-modified priorities).
@@ -716,18 +804,51 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{ added: num
   const baseline = readNativeBaseline(catalogPath);
   const goIds = new Set(enabledGo.map(m => m.id));
   const native = (catalog.models ?? [])
-    .filter(m => typeof m.slug === "string" && !(m.slug as string).includes("/") && !goIds.has(m.slug as string))
+    .filter(m => typeof m.slug === "string"
+      && !(m.slug as string).includes("/")
+      && !goIds.has(m.slug as string)
+      // Gap B: drop legacy/internal OpenAI-family natives (gpt-5.2, gpt-5.3-codex,
+      // codex-auto-review, …) from the on-disk catalog too, matching the live /v1/models
+      // allowlist. Genuine user-added natives (non gpt-/codex- slugs) are preserved.
+      && !isUnsupportedOpenAiNativeSlug(m.slug as string))
     .map(m => {
       const slug = m.slug as string;
-      const priority = rank.has(slug) ? rank.get(slug)! : (baseline.get(slug) ?? (m.priority as number));
+      const baselinePriority = baseline.get(slug) ?? (m.priority as number);
+      const priority = rank.has(slug)
+        ? rank.get(slug)!
+        : featured.length > 0
+          ? Math.max(typeof baselinePriority === "number" ? baselinePriority : 9, featured.length + 100)
+          : baselinePriority;
       return normalizeServiceTiers({ ...m, priority });
     });
+  const nativeSlugs = new Set(native.flatMap(m => typeof m.slug === "string" ? [m.slug] : []));
+  for (const slug of nativeOpenAiSlugs()) {
+    if (nativeSlugs.has(slug)) continue;
+    nativeSlugs.add(slug);
+    const priority = rank.has(slug)
+      ? rank.get(slug)!
+      : featured.length > 0
+        ? featured.length + 100
+        : 9;
+    native.push(deriveEntry(template ? JSON.parse(JSON.stringify(template)) : null, slug, "OpenAI native model (Codex OAuth passthrough).", priority));
+  }
   // Central WS capability override on the FINAL on-disk catalog (the file Codex reads). Applies to
   // native AND routed so the advertised flag matches the implemented endpoint (phase 120.4) and a
   // native template can never leak supports_websockets while the flag is off.
   const wsEnabled = websocketsEnabled(config);
-  catalog.models = [...native, ...goEntries].map(m => {
-    const e = ensureStrictCatalogFields(normalizeServiceTiers(m));
+  // Gap A: never let a transient EMPTY routed fetch wipe routed entries that were on disk. If
+  // gatherRoutedModels returned nothing (provider down / flaky / cache miss) but the pre-sync
+  // catalog DID carry routed entries, preserve those prior routed entries instead of overwriting
+  // them with an empty set — otherwise the Codex picker silently loses kiro/opencode-go models.
+  let routedEntries = goEntries;
+  if (goEntries.length === 0 && catalogHasRoutedEntries(catalog)) {
+    routedEntries = (catalog.models ?? []).filter(m => typeof m.slug === "string" && (m.slug as string).includes("/"));
+    console.warn(`[opencodex] catalog sync: routed model fetch returned empty; preserving ${routedEntries.length} existing routed entr${routedEntries.length === 1 ? "y" : "ies"} on disk.`);
+  }
+  catalog.models = [...native, ...routedEntries].map(m => {
+    const normalized = normalizeServiceTiers(m);
+    applyNativeOpenAiContextOverride(normalized);
+    const e = ensureStrictCatalogFields(normalized);
     if (wsEnabled) e.supports_websockets = true;
     else delete e.supports_websockets;
     return e;
@@ -746,11 +867,19 @@ export function restoreCodexCatalog(): { removed: number; kept: number; path: st
   const catalogPath = readCodexCatalogPath();
   const catalog = readCatalog(catalogPath);
   if (!catalog || !Array.isArray(catalog.models)) return { removed: 0, kept: 0, path: catalogPath };
-  const exactBackup = readCatalog(catalogBackupPathFor(catalogPath));
-  if (exactBackup && Array.isArray(exactBackup.models)) {
-    const removed = Math.max(0, catalog.models.length - exactBackup.models.length);
-    atomicWriteFile(catalogPath, JSON.stringify(exactBackup, null, 2) + "\n");
-    return { removed, kept: exactBackup.models.length, path: catalogPath };
+  const backup = readCatalogBackup(catalogPath);
+  if (backup && Array.isArray(backup.models)) {
+    const removed = (catalog.models ?? []).filter(m => typeof m.slug === "string" && m.slug.includes("/")).length;
+    const backupSlugs = new Set(backup.models.flatMap(m => typeof m.slug === "string" ? [m.slug] : []));
+    const userNativeAdditions = (catalog.models ?? []).filter(m =>
+      typeof m.slug === "string" && !m.slug.includes("/") && !backupSlugs.has(m.slug)
+    );
+    const restored = {
+      ...backup,
+      models: [...backup.models, ...userNativeAdditions],
+    };
+    atomicWriteFile(catalogPath, JSON.stringify(restored, null, 2) + "\n");
+    return { removed, kept: restored.models.length, path: catalogPath };
   }
   const before = catalog.models.length;
   const native = catalog.models.filter(m => !(typeof m.slug === "string" && m.slug.includes("/")));

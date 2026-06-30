@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../src/codex-account-store";
 import { checkAccountIdCollision } from "../src/codex-auth-api";
@@ -28,12 +28,12 @@ afterEach(() => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
 });
 
-function seedAccount(id: string, email: string, chatgptAccountId: string): OcxConfig {
+function seedAccount(id: string, email: string, chatgptAccountId: string, plan?: string): OcxConfig {
   const config: OcxConfig = {
     port: 10100,
     providers: {},
     defaultProvider: "openai",
-    codexAccounts: [{ id, email, isMain: false }],
+    codexAccounts: [{ id, email, plan, isMain: false }],
   };
   saveConfig(config);
   saveCodexAccountCredential(id, {
@@ -54,13 +54,52 @@ describe("codex auth account collision", () => {
     });
   });
 
-  test("rejects the same team member added twice", async () => {
+  test("allows the same email and account id because personal and business subscriptions can coexist", async () => {
+    seedAccount("team-member-a", "member-a@example.test", "shared-team-account");
+
+    expect(checkAccountIdCollision("shared-team-account", "MEMBER-A@example.test", "business")).toEqual({
+      collision: false,
+    });
+  });
+
+  test("rejects the same personal account within the personal bucket", async () => {
     seedAccount("team-member-a", "member-a@example.test", "shared-team-account");
 
     const result = checkAccountIdCollision("shared-team-account", "MEMBER-A@example.test");
     expect(result.collision).toBe(true);
     if (result.collision) {
       expect(result.reason).toContain("Account is already in the pool");
+    }
+  });
+
+  test("rejects the same workspace account within the workspace bucket", async () => {
+    seedAccount("workspace-a", "member-a@example.test", "shared-team-account", "team");
+
+    const result = checkAccountIdCollision("shared-team-account", "MEMBER-A@example.test", "business");
+    expect(result.collision).toBe(true);
+    if (result.collision) {
+      expect(result.reason).toContain("Account is already in the pool");
+    }
+  });
+
+  test("rejects a pool account matching the main Codex login account id", async () => {
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: {
+        access_token: "not-a-jwt",
+        account_id: "main-chatgpt-account",
+      },
+    }));
+    saveConfig({
+      port: 10100,
+      providers: {},
+      defaultProvider: "openai",
+      codexAccounts: [],
+    } as OcxConfig);
+
+    const result = checkAccountIdCollision("main-chatgpt-account", "main@example.test", "business");
+    expect(result.collision).toBe(true);
+    if (result.collision) {
+      expect(result.reason).toContain("main Codex login");
     }
   });
 });

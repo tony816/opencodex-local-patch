@@ -52,13 +52,13 @@ flowchart LR
 | Linux (x64 / arm64) | Fully supported | systemd (user unit) |
 | Windows (x64) | Fully supported | Task Scheduler |
 
-Requires [Bun](https://bun.sh) 1.1+. All three platforms work natively (no WSL needed on Windows).
+Requires [Node](https://nodejs.org) 18+. The Bun runtime is bundled automatically on `npm install` — no separate Bun install needed. All three platforms work natively (no WSL needed on Windows).
 
 ## Quick start
 
 ```bash
-# Install
-npm install -g @bitkyc08/opencodex      # or: bun install -g @bitkyc08/opencodex
+# Install (bundles the Bun runtime automatically — only Node 18+ required)
+npm install -g @bitkyc08/opencodex
 
 # Interactive setup (writes config, injects into Codex, and offers autostart shim install)
 ocx init
@@ -74,19 +74,18 @@ codex "Write a hello world in Rust"
 ```
 
 <details>
-<summary><b>Don't have <a href="https://bun.sh">bun</a>?</b> — install it first (opencodex runs on bun)</summary>
+<summary><b>"bundled Bun runtime is missing" error?</b></summary>
 
 <br/>
 
+opencodex bundles the Bun runtime as a dependency and runs it via a Node
+launcher, so you do **not** need to install Bun yourself. If you see a
+"bundled Bun runtime is missing" error, the install skipped lifecycle scripts
+or optional dependencies. Reinstall without those flags:
+
 ```bash
-# macOS / Linux / WSL
-curl -fsSL https://bun.sh/install | bash
-
-# Windows (PowerShell)
-powershell -c "irm bun.sh/install.ps1 | iex"
+npm install -g @bitkyc08/opencodex   # no --ignore-scripts, no --omit=optional
 ```
-
-Then re-run `npm install -g @bitkyc08/opencodex`. (The `ocx` binary is bun-native, so bun must be on your `PATH`.)
 
 </details>
 
@@ -198,7 +197,7 @@ ocx login <xai|anthropic|kimi> # OAuth login
 ocx logout <provider>          # remove a stored login
 ocx gui                        # open the web dashboard
 ocx service <install|start|stop|status|uninstall>   # background service (launchd/systemd/schtasks)
-ocx update                     # update opencodex to the latest published version
+ocx update [--tag preview]     # update opencodex; preview installs stay on @preview
 ```
 
 ### Autostart: service vs shim
@@ -207,7 +206,7 @@ opencodex has two ways to auto-start the proxy:
 
 | | `ocx service install` | `ocx codex-shim install` |
 |---|---|---|
-| **How** | OS service manager (launchd / systemd / schtasks) | Replaces the `codex` binary with a wrapper script |
+| **How** | OS service manager (launchd / systemd / schtasks) | Wraps script launchers for `codex`; real `codex.exe` is left untouched |
 | **When** | Always running after login | On-demand — runs `ocx ensure` when `codex` is launched |
 | **Restart** | Auto-restarts on crash | Starts once per `codex` invocation |
 | **Codex updates** | Unaffected | Repairs on next `ocx codex-shim install` or `ocx update` |
@@ -220,11 +219,11 @@ automatically picks another free local port and updates Codex to use it.
 
 ### Uninstall
 
-Before removing the npm/bun package, clean up local state:
+Before removing the npm package, clean up local state:
 
 ```bash
 ocx uninstall
-npm uninstall -g @bitkyc08/opencodex   # or: bun remove -g @bitkyc08/opencodex
+npm uninstall -g @bitkyc08/opencodex
 ```
 
 `ocx uninstall` stops the proxy, removes any installed service, removes the Codex shim, restores
@@ -265,6 +264,14 @@ Codex-visible context cap, `modelContextWindows` for model-specific caps, and
 `["text", "image"]`. Context values cap live `/models` metadata; they never raise a smaller live
 context window. See the configuration reference for the full field list.
 
+> **GLM-5.2 1M context via Z.AI:** through the `openai-chat` adapter, both `glm-5.2`
+> and `glm-5.2[1m]` work — opencodex strips the trailing `[1m]` suffix before
+> sending the request, since OpenAI-compatible endpoints reject the bracketed id
+> (Z.AI 400 code 1211). The `[1m]` suffix is a Claude-Code / Anthropic-endpoint
+> convention; to use it natively, point the `anthropic` adapter at Z.AI's coding
+> base (`https://api.z.ai/api/coding/paas/v4`). Set the 1M context window via the
+> model catalog (`modelContextWindows`), not the model name.
+
 Local models work too. Point opencodex at any OpenAI-compatible server running on your machine:
 
 ```json
@@ -303,7 +310,9 @@ export OPENCODEX_API_AUTH_TOKEN="your-secret-token"
 ocx start
 ```
 
-The proxy refuses to start without this variable when binding beyond loopback.
+The proxy refuses to start without this variable when binding beyond loopback. If you install a
+background service for LAN access, export the same variable before `ocx service install` so the
+service manager receives it.
 Clients (scripts, remote machines) must include the token in every request:
 
 ```
@@ -339,8 +348,18 @@ Maintainer source-of-truth notes live under [`structure/`](./structure). Histori
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
-bun run dev          # start the proxy in dev mode
+bun run dev:proxy    # start the proxy API in dev mode
+bun run dev:gui      # start the dashboard dev server in another terminal
 bun x tsc --noEmit   # typecheck
+```
+
+`bun run dev` remains an alias for `bun run dev:proxy` for compatibility. In a source checkout,
+the proxy API exposes `/healthz`, `/v1/responses`, and `/api/*`; `GET /` serves the packaged
+dashboard only after `bun run build:gui` has produced `gui/dist`. While hacking on the dashboard,
+run the frontend separately:
+
+```bash
+bun run dev:gui
 ```
 
 See **[Contributing](https://lidge-jun.github.io/opencodex/contributing/)**.

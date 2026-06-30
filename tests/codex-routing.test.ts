@@ -34,6 +34,7 @@ import type { OcxConfig } from "../src/types";
 
 const TEST_DIR = join(import.meta.dir, ".tmp-codex-routing-test");
 let previousOpencodexHome: string | undefined;
+let previousCodexHome: string | undefined;
 
 function makeConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
   return {
@@ -64,6 +65,10 @@ describe("codex routing", () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
+    // Isolate the main-account credential source: TEST_DIR has no auth.json, so the main
+    // account is deterministically absent (these cases test the pool-only scenario).
+    previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = TEST_DIR;
     clearThreadAccountMap();
     clearCodexUpstreamHealth();
     clearAccountQuota();
@@ -83,6 +88,8 @@ describe("codex routing", () => {
     clearAccountNeedsReauth("c");
     if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousOpencodexHome;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -90,6 +97,12 @@ describe("codex routing", () => {
     expect(computeCodexUsageScore({ weeklyPercent: 15, fiveHourPercent: 81 })).toBe(81);
     expect(computeCodexUsageScore({ weeklyPercent: 15, fiveHourPercent: 20, monthlyPercent: 91 })).toBe(91);
     expect(computeCodexUsageScore({ weeklyPercent: 15 })).toBe(15);
+  });
+
+  test("go and free plans use only the 30d quota window", () => {
+    expect(computeCodexUsageScore({ weeklyPercent: 99, fiveHourPercent: 98, monthlyPercent: 12 }, "go")).toBe(12);
+    expect(computeCodexUsageScore({ weeklyPercent: 99, fiveHourPercent: 98, monthlyPercent: 13 }, "free")).toBe(13);
+    expect(computeCodexUsageScore({ weeklyPercent: 1, fiveHourPercent: 2 }, "go")).toBe(CODEX_UNKNOWN_USAGE_SCORE);
   });
 
   test("usage score treats unknown quota conservatively", () => {
@@ -102,6 +115,19 @@ describe("codex routing", () => {
     updateAccountQuota("a", 10, 85);
     updateAccountQuota("b", 20, 5);
     expect(resolveCodexAccountForThread("new-thread", config)).toBe("b");
+  });
+
+  test("go plan pool switching ignores 5h and weekly windows", () => {
+    const config = makeConfig({
+      codexAccounts: [
+        { id: "a", email: "a@test", plan: "go", isMain: false },
+        { id: "b", email: "b@test", plan: "go", isMain: false },
+      ],
+      activeCodexAccountId: "a",
+    });
+    updateAccountQuota("a", 99, 99, undefined, undefined, 10);
+    updateAccountQuota("b", 1, 1, undefined, undefined, 50);
+    expect(resolveCodexAccountForThread("go-monthly-thread", config)).toBe("a");
   });
 
   test("unknown active quota can switch to a known lower usage account", () => {

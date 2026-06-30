@@ -1,4 +1,6 @@
 import type { OcxProviderConfig } from "../types";
+import { KIRO_MODELS, KIRO_MODEL_CONTEXT_WINDOWS, KIRO_MODEL_REASONING_EFFORTS } from "./kiro-models";
+import { ANTIGRAVITY_MODELS, ANTIGRAVITY_MODEL_CONTEXT_WINDOWS } from "./antigravity-models";
 
 export type ProviderAuthKind = "forward" | "oauth" | "key" | "local";
 export type MetadataModelIdNormalize = "case-insensitive";
@@ -33,6 +35,9 @@ export interface ProviderRegistryEntry {
   jawcodeBundle?: string;
   extraMetadataAliases?: string[];
   metadataModelIdNormalize?: MetadataModelIdNormalize;
+  googleMode?: "ai-studio" | "vertex" | "cloud-code-assist";
+  project?: string;
+  location?: string;
 }
 
 export type ProviderConfigSeed = Pick<
@@ -42,6 +47,7 @@ export type ProviderConfigSeed = Pick<
   | "reasoningEfforts" | "modelReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap"
   | "noVisionModels" | "noReasoningModels" | "noTemperatureModels" | "noTopPModels" | "noPenaltyModels"
   | "autoToolChoiceOnlyModels" | "preserveReasoningContentModels" | "escapeBuiltinToolNames"
+  | "googleMode" | "project" | "location"
 >;
 
 
@@ -158,6 +164,20 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     autoToolChoiceOnlyModels: ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"],
     preserveReasoningContentModels: KIMI_THINKING_MODELS,
   },
+  {
+    id: "kiro",
+    label: "Kiro (AWS CodeWhisperer)",
+    adapter: "kiro",
+    baseUrl: "https://runtime.us-east-1.kiro.dev",
+    authKind: "oauth",
+    oauthId: "kiro",
+    note: "Import-first: reuses your installed kiro-cli login (no browser). Experimental third-party harness — see Kiro ToS.",
+    models: KIRO_MODELS,
+    defaultModel: "kiro-auto",
+    // Context windows sourced from Kiro's official model catalog (kiro.dev/docs/models/).
+    modelContextWindows: KIRO_MODEL_CONTEXT_WINDOWS,
+    modelReasoningEfforts: KIRO_MODEL_REASONING_EFFORTS,
+  },
   { id: "openai-apikey", label: "OpenAI (API key)", adapter: "openai-responses", baseUrl: "https://api.openai.com/v1", authKind: "key", featured: true, dashboardUrl: "https://platform.openai.com/api-keys", defaultModel: "gpt-5.5" },
   {
     id: "umans",
@@ -245,6 +265,8 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
   { id: "openrouter", label: "OpenRouter", adapter: "openai-chat", baseUrl: "https://openrouter.ai/api/v1", authKind: "key", featured: true, dashboardUrl: "https://openrouter.ai/keys", jawcodeBundle: "openrouter" },
   { id: "groq", label: "Groq", adapter: "openai-chat", baseUrl: "https://api.groq.com/openai/v1", authKind: "key", featured: true, dashboardUrl: "https://console.groq.com/keys" },
   { id: "google", label: "Google Gemini", adapter: "google", baseUrl: "https://generativelanguage.googleapis.com", authKind: "key", featured: true, dashboardUrl: "https://aistudio.google.com/apikey", defaultModel: "gemini-3-pro", jawcodeBundle: "google", extraMetadataAliases: ["gemini"] },
+  { id: "google-vertex", label: "Google Vertex AI", adapter: "google", baseUrl: "https://aiplatform.googleapis.com", authKind: "key", dashboardUrl: "https://console.cloud.google.com/vertex-ai", defaultModel: "gemini-3-pro", googleMode: "vertex", jawcodeBundle: "google", extraMetadataAliases: ["gemini-vertex"] },
+  { id: "google-antigravity", label: "Google Antigravity", adapter: "google", baseUrl: "https://daily-cloudcode-pa.googleapis.com", authKind: "oauth", dashboardUrl: "https://antigravity.google", models: ANTIGRAVITY_MODELS, defaultModel: "gemini-3.5-flash-low", modelContextWindows: ANTIGRAVITY_MODEL_CONTEXT_WINDOWS, googleMode: "cloud-code-assist", jawcodeBundle: "google", extraMetadataAliases: ["antigravity", "gemini-antigravity"] },
   { id: "azure-openai", label: "Azure OpenAI", adapter: "azure-openai", baseUrl: "https://{resource}.openai.azure.com/openai", authKind: "key", featured: true, dashboardUrl: "https://portal.azure.com" },
   { id: "ollama", label: "Ollama (local)", adapter: "openai-chat", baseUrl: "http://localhost:11434/v1", authKind: "local", featured: true, note: "Local — key usually blank", reasoningEffortMap: OLLAMA_REASONING_MAP },
   { id: "vllm", label: "vLLM (local)", adapter: "openai-chat", baseUrl: "http://localhost:8000/v1", authKind: "local", featured: true, note: "Local — key usually blank" },

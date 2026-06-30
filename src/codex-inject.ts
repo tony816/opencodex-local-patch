@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { atomicWriteFile, websocketsEnabled } from "./config";
+import { markJournalInjectedState, restoreJournalState, writeJournal } from "./codex-journal";
 import { restoreCodexCatalog } from "./codex-catalog";
 import { syncCodexHistoryProvider } from "./codex-history-provider";
 import { CODEX_CONFIG_PATH, CODEX_PROFILE_PATH, DEFAULT_CATALOG_PATH, parseTomlString, readRootTomlString, resolveCodexConfigPath, tomlString } from "./codex-paths";
@@ -24,16 +25,36 @@ export interface InjectCodexOptions {
  * whatever `[table]` happened to be open last (e.g. `[plugins."chrome@openai-bundled"]`), so Codex
  * never saw a global model_provider and silently fell back to the `openai` (ChatGPT) provider.
  */
-export function buildProviderTableBlock(port: number, supportsWebsockets = false): string {
+function isLoopbackHostname(hostname: string | undefined): boolean {
+  const normalized = (hostname ?? "127.0.0.1").trim().toLowerCase();
+  return normalized === "" || normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "[::1]";
+}
+
+function providerBaseHost(hostname: string | undefined): string {
+  const trimmed = (hostname ?? "127.0.0.1").trim();
+  if (isLoopbackHostname(trimmed) || trimmed === "0.0.0.0" || trimmed === "::" || trimmed === "[::]") return "localhost";
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) return trimmed;
+  return trimmed.includes(":") ? `[${trimmed}]` : trimmed;
+}
+
+function shouldInjectApiAuthHeader(config: Pick<OcxConfig, "hostname"> | undefined): boolean {
+  return !isLoopbackHostname(config?.hostname);
+}
+
+export function buildProviderTableBlock(port: number, supportsWebsockets = false, includeApiAuthHeader = false, hostname?: string): string {
+  const host = providerBaseHost(hostname);
   const lines = [
     "",
     OCX_SECTION_MARKER,
     "[model_providers.opencodex]",
     'name = "OpenCodex Proxy"',
-    `base_url = "http://localhost:${port}/v1"`,
+    `base_url = "http://${host}:${port}/v1"`,
     'wire_api = "responses"',
     "requires_openai_auth = true",
   ];
+  if (includeApiAuthHeader) {
+    lines.push('env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_AUTH_TOKEN" }');
+  }
   if (supportsWebsockets) lines.push("supports_websockets = true");
   return lines.join("\n") + "\n";
 }
@@ -60,7 +81,13 @@ function stripExistingModelProvider(content: string): string {
   return out.join("\n");
 }
 
-function stripRootContextWindowOverrides(content: string): string {
+/**
+ * Drop ROOT-level `model_context_window` / `model_auto_compact_token_limit` overrides (keys before
+ * the first table header). Codex treats these root keys as a global override that wins over the
+ * per-model catalog values, so a stale `model_context_window = 1000000` makes every model (e.g.
+ * gpt-5.5) report a 1M window. Stripping them on (re)injection lets the catalog drive context size.
+ */
+export function stripRootContextWindowOverrides(content: string): string {
   const lines = content.split("\n");
   const firstTable = lines.findIndex(l => /^\s*\[/.test(l));
   return lines
@@ -141,7 +168,7 @@ function removeProfileSection(content: string): string {
       continue;
     }
     if (inProfile) {
-      if (line.startsWith("[") && line.trim() !== "[profiles.opencodex]") {
+      if (/^\s*\[/.test(line) && line.trim() !== "[profiles.opencodex]") {
         inProfile = false;
         filtered.push(line);
       }
@@ -192,14 +219,16 @@ function stripOpencodexCatalogPath(content: string): string {
     .join("\n");
 }
 
-export function buildProfileFile(port: number, catalogPath?: string | null): string {
+export function buildProfileFile(port: number, catalogPath?: string | null, supportsWebsockets = false, includeApiAuthHeader = false, hostname?: string): string {
+  const host = providerBaseHost(hostname);
   const lines = [
     "# OpenCodex proxy profile — use with: codex --profile opencodex",
-    `# Routes all model requests through the opencodex proxy at localhost:${port}`,
+    `# Routes all model requests through the opencodex proxy at ${host}:${port}`,
     'model_provider = "opencodex"',
   ];
   if (catalogPath) lines.push(`model_catalog_json = ${tomlString(catalogPath)}`);
-  lines.push("", "[features]", "fast_mode = true", "");
+  lines.push("", "[features]", "fast_mode = true");
+  lines.push(buildProviderTableBlock(port, supportsWebsockets, includeApiAuthHeader, hostname).trimEnd(), "");
   return lines.join("\n");
 }
 
@@ -220,6 +249,7 @@ export async function injectCodexConfig(port: number, config?: OcxConfig, option
     return { success: false, message: `Codex config not found at ${CODEX_CONFIG_PATH}. Is Codex installed?` };
   }
 
+  writeJournal();
   let content = readFileSync(CODEX_CONFIG_PATH, "utf-8");
 
   // Idempotent clean-up of any prior injection: drop the provider table (marker-based) and every
@@ -240,10 +270,12 @@ export async function injectCodexConfig(port: number, config?: OcxConfig, option
   // 1) Root key BEFORE the first table header (must be a global, not nested under a table).
   content = setRootModelProvider(content);
   // 2) Provider table appended at EOF (position-independent).
-  content = content.trimEnd() + "\n" + buildProviderTableBlock(port, websocketsEnabled(config ?? {}));
+  content = content.trimEnd() + "\n" + buildProviderTableBlock(port, websocketsEnabled(config ?? {}), shouldInjectApiAuthHeader(config), config?.hostname);
 
-  writeFileSync(CODEX_CONFIG_PATH, content, "utf-8");
-  writeFileSync(CODEX_PROFILE_PATH, buildProfileFile(port, catalogPath), "utf-8");
+  const profileContent = buildProfileFile(port, catalogPath, websocketsEnabled(config ?? {}), shouldInjectApiAuthHeader(config), config?.hostname);
+  atomicWriteFile(CODEX_CONFIG_PATH, content);
+  atomicWriteFile(CODEX_PROFILE_PATH, profileContent);
+  markJournalInjectedState(content, profileContent);
   const history = config?.syncResumeHistory !== false
     ? syncCodexHistoryProvider("opencodex")
     : { rows: 0, files: 0 };
@@ -278,7 +310,7 @@ function removeOcxSection(content: string): string {
     if (inOcxSection) {
       // End the injected section at the next table header that ISN'T our own — exact match so a
       // user's "[model_providers.opencodex_backup]" (or similar) is preserved, not swallowed.
-      if (line.startsWith("[") && line.trim() !== "[model_providers.opencodex]") {
+      if (/^\s*\[/.test(line) && line.trim() !== "[model_providers.opencodex]") {
         inOcxSection = false;
         filtered.push(line);
       }
@@ -292,6 +324,7 @@ function removeOcxSection(content: string): string {
 /** Pure transform: strip the opencodex provider block + `model_provider = "opencodex"` lines. */
 export function stripOpencodexConfig(content: string): string {
   let out = content;
+  const hadRootOcxProvider = readRootTomlString(out, "model_provider") === "opencodex";
   if (out.includes("[model_providers.opencodex]")) {
     out = removeOcxSection(out);
   }
@@ -299,8 +332,7 @@ export function stripOpencodexConfig(content: string): string {
   // Regex (not exact-string) removal so compact `model_provider="opencodex"` is stripped too —
   // must match the detection regex above, or a detected line could survive un-removed.
   out = out.split("\n").filter(l => !/^\s*model_provider\s*=\s*"opencodex"\s*$/.test(l)).join("\n");
-  out = stripRootContextWindowOverrides(out);
-  out = stripRootRoutedModel(out);
+  if (hadRootOcxProvider) out = stripRootRoutedModel(out);
   out = stripOpencodexCatalogPath(out);
   return out.replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
 }
@@ -309,7 +341,7 @@ function hasOpencodexRouting(content: string): boolean {
   return content.includes("[model_providers.opencodex]") || /^\s*model_provider\s*=\s*"opencodex"/m.test(content);
 }
 
-export function removeCodexConfig(): { success: boolean; message: string } {
+export function removeCodexConfig(options: { preserveProfile?: boolean } = {}): { success: boolean; message: string } {
   if (!existsSync(CODEX_CONFIG_PATH)) {
     return { success: false, message: "Codex config not found." };
   }
@@ -320,10 +352,12 @@ export function removeCodexConfig(): { success: boolean; message: string } {
   } else if (stripOpencodexConfig(content) !== content) {
     atomicWriteFile(CODEX_CONFIG_PATH, stripOpencodexConfig(content));
   }
-  if (existsSync(CODEX_PROFILE_PATH)) unlinkSync(CODEX_PROFILE_PATH);
+  if (!options.preserveProfile && existsSync(CODEX_PROFILE_PATH)) unlinkSync(CODEX_PROFILE_PATH);
   return {
     success: true,
-    message: had ? "Removed opencodex routing from Codex config + profile." : "opencodex not present in Codex config.",
+    message: had
+      ? `Removed opencodex routing from Codex config${options.preserveProfile ? "." : " + profile."}`
+      : "opencodex not present in Codex config.",
   };
 }
 
@@ -333,7 +367,10 @@ export function removeCodexConfig(): { success: boolean; message: string } {
  * handler, and `ocx restore`. Idempotent + atomic.
  */
 export function restoreNativeCodex(): { success: boolean; message: string } {
-  const cfg = removeCodexConfig();
+  const journal = restoreJournalState();
+  const cfg = journal.configRestored
+    ? { success: true, message: "Codex config restored from opencodex journal." }
+    : removeCodexConfig({ preserveProfile: journal.profileRestored || journal.profileChanged });
   const cat = restoreCodexCatalog();
   const history = syncCodexHistoryProvider("openai");
   const msg = cat.removed > 0

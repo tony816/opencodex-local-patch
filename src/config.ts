@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import * as z from "zod/v4";
 import type { OcxConfig } from "./types";
 
@@ -16,8 +16,14 @@ export function atomicWriteFile(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
+let resolvedConfigDirCache: { raw: string | undefined; path: string } | null = null;
+
 function resolveConfigDir(): string {
-  return process.env["OPENCODEX_HOME"] || join(homedir(), ".opencodex");
+  const raw = process.env["OPENCODEX_HOME"]?.trim() || undefined;
+  if (resolvedConfigDirCache && resolvedConfigDirCache.raw === raw) return resolvedConfigDirCache.path;
+  const path = raw ? resolve(raw) : join(homedir(), ".opencodex");
+  resolvedConfigDirCache = { raw, path };
+  return path;
 }
 
 function resolveConfigPath(): string {
@@ -28,6 +34,10 @@ function resolvePidPath(): string {
   return join(resolveConfigDir(), "ocx.pid");
 }
 
+function resolveRuntimePortPath(): string {
+  return join(resolveConfigDir(), "runtime-port.json");
+}
+
 const warnedConfigFallbacks = new Set<string>();
 
 const providerConfigSchema = z.object({
@@ -35,12 +45,89 @@ const providerConfigSchema = z.object({
   baseUrl: z.string().min(1),
 }).passthrough();
 
+const RESERVED_PROVIDER_NAMES = new Set(["__proto__", "prototype", "constructor"]);
+const PROVIDER_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
+const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const SENSITIVE_PROVIDER_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "proxy-authorization",
+  "x-api-key",
+  "x-goog-api-key",
+  "x-amz-security-token",
+]);
+
+export function isValidProviderName(name: string): boolean {
+  const trimmed = name.trim();
+  return trimmed === name
+    && PROVIDER_NAME_PATTERN.test(name)
+    && !RESERVED_PROVIDER_NAMES.has(name.toLowerCase());
+}
+
+export function hasOwnProvider(providers: Record<string, unknown>, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(providers, name);
+}
+
+export function providerBaseUrlConfigError(baseUrl: string): string | null {
+  try {
+    const parsed = new URL(baseUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "baseUrl must be an http(s) URL";
+    if (parsed.username || parsed.password) return "baseUrl must not include embedded credentials";
+    if (parsed.search || parsed.hash) return "baseUrl must not include query strings or fragments";
+  } catch {
+    return "baseUrl must be a valid URL";
+  }
+  return null;
+}
+
+export function providerHeadersConfigError(headers: unknown): string | null {
+  if (headers === undefined) return null;
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return "headers must be an object";
+  for (const [name, value] of Object.entries(headers)) {
+    const normalized = name.trim().toLowerCase();
+    if (!normalized || !HEADER_NAME_PATTERN.test(name)) return "headers must use valid HTTP header names";
+    if (SENSITIVE_PROVIDER_HEADERS.has(normalized)) return `headers must not include sensitive header "${name}"; use apiKey/authMode instead`;
+    if (typeof value !== "string") return `header "${name}" value must be a string`;
+    if (/[\r\n]/.test(value)) return `header "${name}" value must not include line breaks`;
+  }
+  return null;
+}
+
 const configSchema = z.object({
   port: z.number().int().min(0).max(65535).default(10100),
   providers: z.record(z.string(), providerConfigSchema),
   defaultProvider: z.string().min(1).default("openai"),
+  providerContextCaps: z.record(z.string(), z.number().int().positive()).optional(),
+  contextCapValue: z.number().int().positive().optional(),
 }).passthrough().superRefine((config, ctx) => {
-  if (Object.keys(config.providers).length > 0 && !(config.defaultProvider in config.providers)) {
+  for (const name of Object.keys(config.providers)) {
+    if (!isValidProviderName(name)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", name],
+        message: "provider names must use letters, numbers, dot, underscore, or hyphen and cannot be reserved JavaScript object keys",
+      });
+    }
+    const provider = config.providers[name];
+    const baseUrlError = providerBaseUrlConfigError(provider.baseUrl);
+    if (baseUrlError) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", name, "baseUrl"],
+        message: baseUrlError,
+      });
+    }
+    const headersError = providerHeadersConfigError((provider as { headers?: unknown }).headers);
+    if (headersError) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["providers", name, "headers"],
+        message: headersError,
+      });
+    }
+  }
+  if (!hasOwnProvider(config.providers, config.defaultProvider)) {
     ctx.addIssue({
       code: "custom",
       path: ["defaultProvider"],
@@ -68,6 +155,10 @@ export function getConfigPath(): string {
 
 export function getPidPath(): string {
   return resolvePidPath();
+}
+
+export function getRuntimePortPath(): string {
+  return resolveRuntimePortPath();
 }
 
 export function hardenConfigDir(): void {
@@ -117,6 +208,57 @@ export function loadConfig(): OcxConfig {
   } catch (error) {
     warnAndBackupInvalidConfig(configPath, error);
     return getDefaultConfig();
+  }
+}
+
+export type ConfigDiagnostics = {
+  config: OcxConfig;
+  source: "default" | "file" | "fallback";
+  error: string | null;
+};
+
+function mergeConfigDefaults(parsed: unknown): unknown {
+  if (!parsed || typeof parsed !== "object") return parsed;
+  const defaults = getDefaultConfig();
+  const raw = parsed as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...defaults, ...raw };
+  if (raw.providers && typeof raw.providers === "object" && defaults.providers) {
+    merged.providers = { ...defaults.providers, ...(raw.providers as Record<string, unknown>) };
+  }
+  return merged;
+}
+
+function configIssuePaths(error: z.ZodError): string[] {
+  const paths = error.issues.map(issue => issue.path.join(".") || "config");
+  return [...new Set(paths)].sort();
+}
+
+function schemaDiagnosticsError(error: z.ZodError): string {
+  const paths = configIssuePaths(error);
+  return paths.length > 0 ? `schema_invalid: ${paths.join(", ")}` : "schema_invalid";
+}
+
+export function readConfigDiagnostics(): ConfigDiagnostics {
+  const configPath = getConfigPath();
+  if (!existsSync(configPath)) {
+    return { config: getDefaultConfig(), source: "default", error: null };
+  }
+  try {
+    const raw = readFileSync(configPath, "utf-8").replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(raw);
+    const result = configSchema.safeParse(parsed);
+    if (result.success) {
+      return { config: result.data as OcxConfig, source: "file", error: null };
+    }
+
+    const retryResult = configSchema.safeParse(mergeConfigDefaults(parsed));
+    if (retryResult.success) {
+      return { config: retryResult.data as OcxConfig, source: "file", error: null };
+    }
+
+    return { config: getDefaultConfig(), source: "fallback", error: schemaDiagnosticsError(result.error) };
+  } catch {
+    return { config: getDefaultConfig(), source: "fallback", error: "invalid_json" };
   }
 }
 
@@ -176,6 +318,34 @@ export function writePid(pid: number): void {
   atomicWriteFile(getPidPath(), String(pid));
 }
 
+export type RuntimePortState = {
+  pid: number;
+  port: number;
+  hostname?: string;
+};
+
+function isValidRuntimePortState(value: unknown): value is RuntimePortState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Record<string, unknown>;
+  const hostnameOk = state.hostname === undefined || typeof state.hostname === "string";
+  return Number.isSafeInteger(state.pid)
+    && Number(state.pid) > 0
+    && Number.isInteger(state.port)
+    && Number(state.port) > 0
+    && Number(state.port) <= 65535
+    && hostnameOk;
+}
+
+export function writeRuntimePort(state: RuntimePortState): void {
+  const dir = getConfigDir();
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } else {
+    hardenConfigDir();
+  }
+  atomicWriteFile(getRuntimePortPath(), JSON.stringify(state, null, 2) + "\n");
+}
+
 export function readPid(): number | null {
   const pidPath = getPidPath();
   if (!existsSync(pidPath)) return null;
@@ -192,6 +362,17 @@ export function readPid(): number | null {
       }
       return null;
     }
+  } catch {
+    return null;
+  }
+}
+
+export function readRuntimePort(expectedPid?: number): RuntimePortState | null {
+  try {
+    const parsed = JSON.parse(readFileSync(getRuntimePortPath(), "utf-8"));
+    if (!isValidRuntimePortState(parsed)) return null;
+    if (expectedPid !== undefined && parsed.pid !== expectedPid) return null;
+    return parsed;
   } catch {
     return null;
   }
@@ -217,6 +398,13 @@ function readPidFileValue(): number | null {
   } catch {
     return null;
   }
+}
+
+export function removeRuntimePort(expectedPid?: number): void {
+  if (expectedPid !== undefined && readRuntimePort(expectedPid) === null) return;
+  try {
+    unlinkSync(getRuntimePortPath());
+  } catch { /* ignore */ }
 }
 
 export function parsePidFile(raw: string): number | null {
@@ -273,7 +461,7 @@ function warnAndBackupInvalidConfig(configPath: string, error: unknown): void {
   console.error(`Could not load opencodex config at ${configPath}: ${reason}. Using default config.${backupNote}`);
 }
 
-function backupInvalidConfig(configPath: string): string | null {
+export function backupInvalidConfig(configPath: string): string | null {
   if (!existsSync(configPath)) return null;
   const backupPath = `${configPath}.invalid-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   try {

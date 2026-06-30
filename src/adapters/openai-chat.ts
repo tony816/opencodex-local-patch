@@ -1,9 +1,18 @@
 import type { ProviderAdapter } from "./base";
 import { debugDroppedFrame } from "../debug";
 import type { AdapterEvent, OcxAssistantMessage, OcxContentPart, OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTextContent, OcxThinkingContent, OcxToolCall, OcxUsage } from "../types";
-import { modelInList, namespacedToolName } from "../types";
+import { isAllowedToolChoice, modelInList, namespacedToolName, resolveToolChoiceWireName, toolAllowedByChoice } from "../types";
 import { mapReasoningEffort } from "../reasoning-effort";
 import { contentPartsToText } from "./image";
+
+// Z.AI's "glm-5.2[1m]" 1M-context id is a Claude-Code / Anthropic-endpoint-only
+// convention; OpenAI-compatible chat-completions endpoints reject the bracketed
+// suffix (Z.AI 400 code 1211 "Unknown Model"). Strip a single trailing "[...]"
+// group from the wire model id so the bare id is sent. Applies to the
+// openai-chat path only — the anthropic adapter keeps the suffix verbatim.
+export function stripBracketedModelSuffix(modelId: string): string {
+  return modelId.replace(/\[[^\]]*\]\s*$/, "");
+}
 
 function messagesToChatFormat(parsed: OcxParsedRequest, provider: OcxProviderConfig): unknown[] {
   const out: unknown[] = [];
@@ -115,7 +124,14 @@ function safeToolName(name: string | undefined): string {
 
 function toolsToChatFormat(parsed: OcxParsedRequest): unknown[] | undefined {
   if (!parsed.context.tools || parsed.context.tools.length === 0) return undefined;
-  return parsed.context.tools.map(t => ({
+  const allowed = isAllowedToolChoice(parsed.options.toolChoice)
+    ? new Set(parsed.options.toolChoice.allowedTools)
+    : undefined;
+  const tools = allowed
+    ? parsed.context.tools.filter(t => toolAllowedByChoice(t, allowed))
+    : parsed.context.tools;
+  if (tools.length === 0) return undefined;
+  return tools.map(t => ({
     type: "function",
     function: {
       name: namespacedToolName(t.namespace, t.name),
@@ -126,10 +142,11 @@ function toolsToChatFormat(parsed: OcxParsedRequest): unknown[] | undefined {
   }));
 }
 
-function toolChoiceToChatFormat(tc: OcxParsedRequest["options"]["toolChoice"]): unknown {
+function toolChoiceToChatFormat(tc: OcxParsedRequest["options"]["toolChoice"], tools: OcxParsedRequest["context"]["tools"]): unknown {
   if (!tc) return undefined;
+  if (isAllowedToolChoice(tc)) return tc.mode === "required" ? "required" : "auto";
   if (tc === "auto" || tc === "none" || tc === "required") return tc;
-  if ("name" in tc) return { type: "function", function: { name: tc.name } };
+  if ("name" in tc) return { type: "function", function: { name: resolveToolChoiceWireName(tools, tc.name) } };
   return undefined;
 }
 
@@ -152,10 +169,10 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
     buildRequest(parsed: OcxParsedRequest) {
       const messages = messagesToChatFormat(parsed, provider);
       const tools = toolsToChatFormat(parsed);
-      const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice);
+      const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice, parsed.context.tools);
 
       const body: Record<string, unknown> = {
-        model: parsed.modelId,
+        model: stripBracketedModelSuffix(parsed.modelId),
         messages,
         stream: parsed.stream,
       };

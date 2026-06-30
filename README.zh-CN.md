@@ -27,13 +27,13 @@ Codex CLI / App / SDK ──/v1/responses──▶ opencodex ──▶ Any provi
 | Linux (x64 / arm64) | 完整支持 | systemd（用户级） |
 | Windows (x64) | 完整支持 | Task Scheduler |
 
-需要 [Bun](https://bun.sh) 1.1+。三个平台都原生运行（Windows 不需要 WSL）。
+需要 [Node](https://nodejs.org) 18+。Bun 运行时会在 `npm install` 时自动打包，无需单独安装。三个平台都原生运行（Windows 不需要 WSL）。
 
 ## 快速开始
 
 ```bash
-# 安装
-npm install -g @bitkyc08/opencodex      # 或者: bun install -g @bitkyc08/opencodex
+# 安装（自动打包 Bun 运行时 —— 只需 Node 18+）
+npm install -g @bitkyc08/opencodex
 
 # 交互式初始化（写入配置 + 注入 Codex）
 ocx init
@@ -46,19 +46,15 @@ codex "Write a hello world in Rust"
 ```
 
 <details>
-<summary><b>还没装 <a href="https://bun.sh">bun</a>？</b> —— 先装一下（opencodex 跑在 bun 上）</summary>
+<summary><b>遇到 "bundled Bun runtime is missing" 错误？</b></summary>
 
 <br/>
 
+opencodex 把 Bun 运行时作为依赖打包，并通过 Node 启动器运行，所以你**不需要**自己安装 Bun。如果看到 "bundled Bun runtime is missing" 错误，说明安装时跳过了 lifecycle 脚本或 optional 依赖。请不带这些标志重新安装：
+
 ```bash
-# macOS / Linux / WSL
-curl -fsSL https://bun.sh/install | bash
-
-# Windows (PowerShell)
-powershell -c "irm bun.sh/install.ps1 | iex"
+npm install -g @bitkyc08/opencodex   # 不要加 --ignore-scripts、--omit=optional
 ```
-
-装完之后重新跑 `npm install -g @bitkyc08/opencodex`。（`ocx` 是 bun 原生二进制，所以 bun 必须在你的 `PATH` 里。）
 
 </details>
 
@@ -130,7 +126,7 @@ ocx logout <provider>          # 移除已保存的登录
 ocx gui                        # 打开 Web 仪表盘
 ocx codex-shim install         # 运行 codex 时自动启动代理
 ocx service <install|start|stop|status|uninstall>   # 后台服务（launchd/systemd/schtasks）
-ocx update                     # 更新到最新版
+ocx update [--tag preview]     # 更新 opencodex；preview 安装保持 @preview
 ```
 
 ### 自动启动：service vs shim
@@ -139,7 +135,7 @@ opencodex 提供两种自动启动代理的方式：
 
 | | `ocx service install` | `ocx codex-shim install` |
 |---|---|---|
-| **方式** | OS 服务管理器（launchd / systemd / schtasks） | 将 `codex` 二进制替换为包装脚本 |
+| **方式** | OS 服务管理器（launchd / systemd / schtasks） | 包装 `codex` 脚本启动器；不会改动真实 `codex.exe` |
 | **时机** | 登录后始终运行 | 按需 — 仅在运行 `codex` 时启动 |
 | **重启** | 崩溃后自动重启 | 每次调用 `codex` 时启动一次 |
 | **Codex 更新** | 不受影响 | 下次运行 `ocx codex-shim install` 或 `ocx update` 时修复 |
@@ -211,6 +207,15 @@ cd opencodex
 bun install
 bun run dev          # 以开发模式启动代理
 bun x tsc --noEmit   # 类型检查
+```
+
+`bun run dev` 只启动代理 API（`/healthz`、`/v1/responses`、`/api/*`）。它不会同时在 `/`
+提供打包后的仪表盘。要打开仪表盘，请使用已安装的 `ocx gui`；如果要开发前端，请单独运行：
+
+```bash
+cd gui
+bun install
+bun dev
 ```
 
 参阅 **[贡献指南](https://lidge-jun.github.io/opencodex/zh-cn/contributing/)**。

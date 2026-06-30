@@ -12,7 +12,7 @@ import type {
 } from "../types";
 import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
-import { extractHostedWebSearch } from "../web-search/synthetic-tool";
+import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -73,15 +73,25 @@ function mapToolChoice(value: unknown): OcxRequestOptions["toolChoice"] {
     if ((t === "function" || t === "custom") && "name" in value) {
       return { name: (value as { name: string }).name };
     }
+    if (t === "allowed_tools" && Array.isArray(value.tools)) {
+      const names = value.tools
+        .map(allowedToolName)
+        .filter((name): name is string => Boolean(name));
+      return names.length > 0
+        ? { allowedTools: [...new Set(names)], mode: value.mode === "required" ? "required" : "auto" }
+        : "none";
+    }
     return "auto";
   }
   return undefined;
 }
 
-function normalizeToolParameters(parameters: unknown): Record<string, unknown> {
-  if (!isObj(parameters)) return { type: "object", properties: {} };
-  if (parameters.type === "object") return parameters;
-  return { ...parameters, type: "object" };
+function allowedToolName(tool: unknown): string | undefined {
+  if (!isObj(tool)) return undefined;
+  if (typeof tool.name === "string" && tool.name.length > 0) return tool.name;
+  if (tool.type === "web_search" || tool.type === "web_search_preview") return WEB_SEARCH_TOOL_NAME;
+  if (tool.type === "tool_search") return "tool_search";
+  return undefined;
 }
 
 function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
@@ -91,7 +101,7 @@ function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
     const tool: OcxTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
-      parameters: normalizeToolParameters(t.parameters),
+      parameters: (t.parameters ?? {}) as Record<string, unknown>,
     };
     if (t.strict !== undefined) tool.strict = t.strict as boolean;
     if (namespace) tool.namespace = namespace;
@@ -126,14 +136,14 @@ function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
       out.push({
         name: "tool_search",
         description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-        parameters: normalizeToolParameters(isObj(t.parameters) ? t.parameters : {
+        parameters: (isObj(t.parameters) ? t.parameters : {
           type: "object",
           properties: {
             query: { type: "string", description: "Search query for tools to load." },
             limit: { type: "number", description: "Maximum number of tools to return." },
           },
           required: ["query"],
-        }),
+        }) as Record<string, unknown>,
         toolSearch: true,
       });
     }
@@ -385,6 +395,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   if (!summaryMode || summaryMode === "none") options.hideThinkingSummary = true;
   if (data.presence_penalty !== undefined) options.presencePenalty = data.presence_penalty;
   if (data.frequency_penalty !== undefined) options.frequencyPenalty = data.frequency_penalty;
+  if (data.service_tier !== undefined) options.serviceTier = data.service_tier;
 
   // Stash the hosted web_search config (if Codex enabled it) so the proxy can run searches via the
   // gpt-mini sidecar for routed providers. buildTools still drops the hosted tool; the sidecar path

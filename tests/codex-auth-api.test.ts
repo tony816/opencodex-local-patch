@@ -143,6 +143,111 @@ describe("codex-auth API", () => {
     expect(data.accounts.find(a => a.id === "pool-mask")?.email).toBe("p***n@example.test");
   });
 
+  test("GET /api/codex-auth/accounts exposes only 30d quota for go and free plans", async () => {
+    const config = makeConfig({
+      codexAccounts: [
+        { id: "pool-go", email: "go@example.test", plan: "go", isMain: false },
+        { id: "pool-free", email: "free@example.test", plan: "free", isMain: false },
+      ],
+    });
+    for (const id of ["pool-go", "pool-free"]) {
+      saveCodexAccountCredential(id, {
+        accessToken: `access-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 5 * 60_000,
+        chatgptAccountId: `acct-${id}`,
+      });
+      updateAccountQuota(id, 91, 92, 111, 222, 33, 333);
+    }
+
+    const req = new Request("http://localhost/api/codex-auth/accounts", { method: "GET" });
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+    const data = await resp!.json() as { accounts: Array<{ id: string; quota?: Record<string, unknown> }> };
+
+    for (const id of ["pool-go", "pool-free"]) {
+      const quota = data.accounts.find(a => a.id === id)?.quota;
+      expect(quota).toMatchObject({ monthlyPercent: 33, monthlyResetAt: 333 });
+      expect(quota).not.toHaveProperty("weeklyPercent");
+      expect(quota).not.toHaveProperty("fiveHourPercent");
+      expect(quota).not.toHaveProperty("weeklyResetAt");
+      expect(quota).not.toHaveProperty("fiveHourResetAt");
+    }
+  });
+
+  test("GET /api/codex-auth/accounts maps go primary quota response to 30d display quota", async () => {
+    const config = makeConfig({
+      codexAccounts: [{ id: "pool-go-primary", email: "go-primary@example.test", plan: "go", isMain: false }],
+    });
+    saveCodexAccountCredential("pool-go-primary", {
+      accessToken: "access-go-primary",
+      refreshToken: "refresh-go-primary",
+      expiresAt: Date.now() + 5 * 60_000,
+      chatgptAccountId: "acct-go-primary",
+    });
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (input: RequestInfo | URL) => {
+        if (String(input).includes("/backend-api/wham/usage")) {
+          return new Response(JSON.stringify({
+            rate_limit: {
+              primary_window: { used_percent: 42, reset_at: 1783000000 },
+              secondary_window: { used_percent: 99, reset_at: 1782000000 },
+            },
+            rate_limit_reset_credits: { available_count: 1 },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return originalFetch(input);
+      };
+
+      const req = new Request("http://localhost/api/codex-auth/accounts?refresh=1", { method: "GET" });
+      const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+      const data = await resp!.json() as { accounts: Array<{ id: string; quota?: Record<string, unknown> }> };
+      const quota = data.accounts.find(a => a.id === "pool-go-primary")?.quota;
+      expect(quota).toMatchObject({ monthlyPercent: 42, monthlyResetAt: 1783000000, resetCredits: 1 });
+      expect(quota).not.toHaveProperty("fiveHourPercent");
+      expect(quota).not.toHaveProperty("weeklyPercent");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("GET /api/codex-auth/accounts whitelists pool account response fields", async () => {
+    const config = makeConfig({
+      codexAccounts: [{
+        id: "pool-safe",
+        email: "person@example.test",
+        plan: "Plus",
+        chatgptAccountId: "acct-config-secret",
+        logLabel: "work",
+        isMain: false,
+      }],
+    });
+    saveCodexAccountCredential("pool-safe", {
+      accessToken: "access-safe",
+      refreshToken: "refresh-safe",
+      expiresAt: Date.now() + 5 * 60_000,
+      chatgptAccountId: "acct-credential-secret",
+    });
+    updateAccountQuota("pool-safe", 10, 20);
+
+    const req = new Request("http://localhost/api/codex-auth/accounts", { method: "GET" });
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+    const data = await resp!.json() as { accounts: Array<Record<string, unknown>> };
+    const pool = data.accounts.find(a => a.id === "pool-safe")!;
+
+    expect(pool).toMatchObject({
+      id: "pool-safe",
+      email: "p***n@example.test",
+      plan: "Plus",
+      logLabel: "work",
+      isMain: false,
+      hasCredential: true,
+    });
+    expect(pool).not.toHaveProperty("chatgptAccountId");
+    expect(JSON.stringify(pool)).not.toContain("acct-config-secret");
+    expect(JSON.stringify(pool)).not.toContain("acct-credential-secret");
+  });
+
   test("POST /api/codex-auth/accounts disables manual import by default before writing credentials", async () => {
     const req = new Request("http://localhost/api/codex-auth/accounts", {
       method: "POST",
@@ -353,6 +458,43 @@ describe("codex-auth API", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test("reset-credit lookup rejects orphaned credential records before upstream fetch", async () => {
+    const config = makeConfig();
+    saveCodexAccountCredential("orphan", {
+      accessToken: "orphan-access",
+      refreshToken: "orphan-refresh",
+      expiresAt: Date.now() + 5 * 60_000,
+      chatgptAccountId: "acct-orphan",
+    });
+    const originalFetch = globalThis.fetch;
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response("unexpected", { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      const req = new Request("http://localhost/api/codex-auth/reset-credits?accountId=orphan", { method: "GET" });
+      const resp = await handleCodexAuthAPI(req, new URL(req.url), config);
+      expect(resp!.status).toBe(404);
+      expect(await resp!.json()).toMatchObject({ error: "Unknown Codex account" });
+      expect(called).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reset-credit consume rejects invalid account ids before credential lookup", async () => {
+    const req = new Request("http://localhost/api/codex-auth/reset-credits/consume", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ accountId: "../bad" }),
+    });
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), makeConfig());
+    expect(resp!.status).toBe(400);
+    expect(await resp!.json()).toMatchObject({ error: "Invalid account id format" });
   });
 
   test("unmatched route returns null", async () => {

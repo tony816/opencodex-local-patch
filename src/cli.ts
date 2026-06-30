@@ -1,117 +1,42 @@
 #!/usr/bin/env bun
-import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, openSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { rmSync } from "node:fs";
 import { restoreNativeCodex } from "./codex-inject";
 import { restoreLegacyOpenaiHistory } from "./codex-history-provider";
-import { codexAutoStartEnabled, getConfigDir, getConfigPath, loadConfig, readPid, removePid, saveConfig, writePid } from "./config";
-import { findAvailablePort } from "./ports";
+import { writeJournal, reconcileJournal } from "./codex-journal";
+import {
+  codexAutoStartEnabled,
+  getConfigDir,
+  loadConfig,
+  readPid,
+  readRuntimePort,
+  removePid,
+  removeRuntimePort,
+  saveConfig,
+  writePid,
+  writeRuntimePort,
+} from "./config";
+import { collectStatus } from "./cli-status";
+import { installCrashGuards } from "./crash-guard";
+import { hasHelpFlag, printSubcommandUsage, printUsage, printVersion } from "./cli-help";
+import { findAvailablePort, shouldPersistSelectedPort } from "./ports";
+import { killProxy } from "./process-control";
 import { serviceCommand, serviceStatusSummary, stopServiceIfInstalled, uninstallServiceIfInstalled } from "./service";
 import { drainAndShutdown, startServer } from "./server";
 import { maybeShowStarPrompt } from "./star-prompt";
+import { maybeShowUpdatePrompt } from "./update-notify";
 
 const args = process.argv.slice(2);
 const command = args[0];
 
-function installProcessErrorGuards(): void {
-  process.on("unhandledRejection", reason => {
-    console.error("Unhandled background error:", reason instanceof Error ? reason.stack ?? reason.message : String(reason));
-  });
-  process.on("uncaughtException", error => {
-    console.error("Uncaught proxy error:", error instanceof Error ? error.stack ?? error.message : String(error));
-  });
+if (command === "--version" || command === "-v" || command === "version") {
+  printVersion();
+  process.exit(0);
 }
 
-installProcessErrorGuards();
-
-function printUsage() {
-  console.log(`opencodex (ocx) — Universal provider proxy for Codex
-
-Usage:
-  ocx init                    Interactive setup (provider + Codex config injection)
-  ocx start [--port <port>]   Start the proxy server (auto-syncs models to Codex)
-  ocx stop [--force]          Stop only when idle, restore native Codex; --force aborts work
-  ocx restore                 Restore native Codex without stopping (alias: eject)
-  ocx recover-history --legacy-openai
-                               Explicitly recover pre-backup syncResumeHistory rows
-  ocx uninstall               Remove service/shim/config and restore native Codex
-  ocx service <sub>           Run as a background service (install|start|stop|status|uninstall)
-  ocx codex-shim <sub>        Auto-start proxy when \`codex\` launches (install|status|uninstall)
-  ocx ensure                  Ensure the proxy is running and Codex config/cache are current
-  ocx sync                    Fetch models from providers and inject into Codex config
-  ocx sync-cache              Refresh Codex's model cache from the active catalog
-  ocx status                  Check proxy server status
-  ocx login <provider>        OAuth login (xai) — opens browser, stores token in ~/.opencodex/auth.json
-  ocx logout <provider>       Remove a stored OAuth login
-  ocx update                  Update opencodex to the latest published version
-  ocx help                    Show this help message
-
-Examples:
-  ocx init                    Set up provider and inject into Codex
-  ocx start                   Start on default port (10100)
-  ocx start --port 8080       Start on custom port
-  ocx sync                    Sync available models to Codex`);
-}
-
-function hasHelpFlag(values: string[]): boolean {
-  return values.some(value => value === "--help" || value === "-h" || value === "help");
-}
-
-function printSubcommandUsage(name: string | undefined): void {
-  switch (name) {
-    case "init":
-      console.log("Usage: ocx init\n\nInteractive setup for providers and Codex config injection.");
-      break;
-    case "start":
-      console.log("Usage: ocx start [--port <port>]\n\nStart the proxy server and sync models to Codex.");
-      break;
-    case "stop":
-      console.log("Usage: ocx stop [--force]\n\nStop the proxy only when idle and restore native Codex config. Use --force to abort active work.");
-      break;
-    case "restore":
-    case "eject":
-      console.log(`Usage: ocx ${name}\n\nRestore native Codex config without stopping the proxy.`);
-      break;
-    case "recover-history":
-      console.log("Usage: ocx recover-history --legacy-openai\n\nExplicitly recover pre-backup syncResumeHistory rows.");
-      break;
-    case "uninstall":
-    case "remove":
-      console.log(`Usage: ocx ${name}\n\nRemove service/shim/config and restore native Codex.`);
-      break;
-    case "service":
-      console.log("Usage: ocx service <install|start|stop|status|uninstall>");
-      break;
-    case "codex-shim":
-      console.log("Usage: ocx codex-shim <install|status|uninstall>");
-      break;
-    case "ensure":
-      console.log("Usage: ocx ensure\n\nEnsure the proxy is running and Codex config/cache are current.");
-      break;
-    case "sync":
-      console.log("Usage: ocx sync\n\nFetch provider models and inject them into Codex config.");
-      break;
-    case "sync-cache":
-      console.log("Usage: ocx sync-cache\n\nRefresh Codex's model cache from the active catalog.");
-      break;
-    case "status":
-      console.log("Usage: ocx status\n\nCheck proxy server status.");
-      break;
-    case "login":
-      console.log("Usage: ocx login <provider>\n\nOAuth or API-key login for a provider.");
-      break;
-    case "logout":
-      console.log("Usage: ocx logout <provider>\n\nRemove a stored provider login.");
-      break;
-    case "gui":
-      console.log("Usage: ocx gui\n\nOpen the opencodex dashboard.");
-      break;
-    case "update":
-      console.log("Usage: ocx update\n\nUpdate opencodex to the latest published version.");
-      break;
-    default:
-      printUsage();
-  }
+if (command === "help" && args[1]) {
+  printSubcommandUsage(args[1]);
+  process.exit(0);
 }
 
 if (command !== undefined && command !== "help" && hasHelpFlag(args.slice(1))) {
@@ -142,10 +67,15 @@ async function syncModelsToCodex(port?: number) {
 }
 
 function parsePortOption(): number | undefined {
+  if (args.length === 1) return undefined;
+  if (args.length !== 3 || args[1] !== "--port") {
+    console.error("Usage: ocx start [--port <port>]");
+    process.exit(1);
+  }
   const portIdx = args.indexOf("--port");
   if (portIdx === -1) return undefined;
   const value = args[portIdx + 1];
-  const port = value ? parseInt(value, 10) : NaN;
+  const port = value && /^\d+$/.test(value) ? Number(value) : NaN;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     console.error("Invalid port number");
     process.exit(1);
@@ -153,19 +83,12 @@ function parsePortOption(): number | undefined {
   return port;
 }
 
-function hasFlag(name: string, shortName?: string): boolean {
-  return args.includes(name) || (shortName ? args.includes(shortName) : false);
-}
-
-function healthHost(hostname?: string): string {
-  return !hostname || hostname === "0.0.0.0" || hostname === "::" ? "127.0.0.1" : hostname;
-}
-
 async function proxyHealthy(port?: number): Promise<boolean> {
   const config = loadConfig();
   const p = port ?? config.port ?? 10100;
   try {
-    const res = await fetch(`http://${healthHost(config.hostname)}:${p}/healthz`, {
+    const hostname = !config.hostname || config.hostname === "0.0.0.0" || config.hostname === "::" ? "127.0.0.1" : config.hostname;
+    const res = await fetch(`http://${hostname}:${p}/healthz`, {
       signal: AbortSignal.timeout(750),
     });
     return res.ok;
@@ -192,7 +115,7 @@ async function chooseListenPort(requestedPort?: number): Promise<number> {
   if (selected !== preferred) {
     console.log(`⚠️  Port ${preferred} is busy; starting opencodex on ${selected}.`);
   }
-  if (config.port !== selected) {
+  if (shouldPersistSelectedPort(config.port, selected, preferred)) {
     config.port = selected;
     saveConfig(config);
   }
@@ -200,6 +123,8 @@ async function chooseListenPort(requestedPort?: number): Promise<number> {
 }
 
 async function handleStart(options: { block?: boolean } = {}) {
+  const requestedPort = parsePortOption();
+  reconcileJournal();
   const existingPid = readPid();
   if (existingPid) {
     const config = loadConfig();
@@ -210,25 +135,66 @@ async function handleStart(options: { block?: boolean } = {}) {
     removePid(existingPid);
   }
 
-  const requestedPort = parsePortOption();
+  // Interactive-only update prompt. Must run BEFORE we bind a port / write a
+  // PID: choosing "Update now" installs globally and exits, so we never want a
+  // live daemon holding resources while it overwrites its own binary.
+  await maybeShowUpdatePrompt();
+
   const port = await chooseListenPort(requestedPort);
 
   const server = startServer(port);
+  // A single request's streaming error must never crash the daemon serving every
+  // other Codex session — capture the full stack to crash.log and stay up.
+  installCrashGuards();
   writePid(process.pid);
 
   const config = loadConfig();
+  writeRuntimePort({ pid: process.pid, port, hostname: config.hostname });
+  writeJournal();
+
+  let cleaned = false;
+  const syncCleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    removePid(process.pid);
+    removeRuntimePort(process.pid);
+    if (!process.env.OCX_SERVICE) { try { restoreNativeCodex(); } catch { /* best-effort restore */ } }
+  };
+
+  let shuttingDown = false;
+  let shutdownStartedAt = 0;
+  // Terminal Ctrl-C delivers SIGINT to the whole foreground group AND the launcher
+  // forwards its own — two signals land within milliseconds. Treat a duplicate inside
+  // this window as the same Ctrl-C (one graceful drain); a deliberate later press
+  // escalates to an immediate force-exit ("gradual kill").
+  const FORCE_AFTER_MS = 500;
   const shutdown = () => {
+    const now = Date.now();
+    if (shuttingDown) {
+      if (now - shutdownStartedAt < FORCE_AFTER_MS) return; // near-simultaneous duplicate — ignore
+      console.log("\n⏹  Force shutdown (second signal).");
+      try { syncCleanup(); } catch { /* best-effort */ }
+      process.exit(130);
+    }
+    shuttingDown = true;
+    shutdownStartedAt = now;
     console.log("\n🛑 Shutting down opencodex proxy...");
     void (async () => {
-      await drainAndShutdown(server, config.shutdownTimeoutMs ?? 5000);
-      removePid(process.pid);
-      if (!process.env.OCX_SERVICE) { try { restoreNativeCodex(); } catch { /* best-effort restore */ } }
-      process.exit(0);
+      try {
+        await drainAndShutdown(server, config.shutdownTimeoutMs ?? 5000);
+      } finally {
+        syncCleanup(); // idempotent (cleaned-guard); also re-run by process.on("exit")
+        process.exit(0);
+      }
     })();
   };
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // The launcher (bin/ocx.mjs) forwards SIGHUP too (e.g. terminal close); handle it
+  // gracefully here so it drains + cleans up instead of a default immediate kill.
+  process.on("SIGHUP", shutdown);
+  process.on("exit", syncCleanup);
 
   await maybeShowStarPrompt(); // once-only [Y/n] GitHub-star prompt on first interactive start
   await syncModelsToCodex(port).catch(() => {});
@@ -239,6 +205,7 @@ async function handleStart(options: { block?: boolean } = {}) {
 }
 
 async function handleEnsure() {
+  reconcileJournal();
   let config = loadConfig();
   if (!codexAutoStartEnabled(config)) {
     console.log("Codex autostart is disabled.");
@@ -252,12 +219,10 @@ async function handleEnsure() {
     return;
   }
 
-  mkdirSync(getConfigDir(), { recursive: true });
-  const serviceLogPath = join(getConfigDir(), "opencodex-service.log");
-  const serviceLogFd = openSync(serviceLogPath, "a");
   const child = spawn(process.execPath, [process.argv[1], "start"], {
     detached: true,
-    stdio: ["ignore", serviceLogFd, serviceLogFd],
+    stdio: "ignore",
+    windowsHide: true,
     env: { ...process.env, OCX_SERVICE: "1" },
   });
   child.unref();
@@ -274,114 +239,7 @@ async function handleEnsure() {
   console.log(`✅ Proxy running on port ${config.port ?? port}`);
 }
 
-function killProxy(pid: number): void {
-  if (!isProcessAlive(pid)) return;
-  if (process.platform === "win32") {
-    const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
-    try {
-      execFileSync(taskkill, ["/PID", String(pid), "/T", "/F"], { stdio: "pipe" });
-    } catch (err) {
-      if (isProcessAlive(pid)) throw err;
-    }
-  } else {
-    process.kill(pid, "SIGTERM");
-    if (!waitForExit(pid, 5000)) process.kill(pid, "SIGKILL");
-  }
-  if (!waitForExit(pid, 5000)) throw new Error(`process ${pid} did not exit`);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function waitForExit(pid: number, timeoutMs: number): boolean {
-  const deadline = Date.now() + timeoutMs;
-  const marker = new Int32Array(new SharedArrayBuffer(4));
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return true;
-    Atomics.wait(marker, 0, 0, 50);
-  }
-  return !isProcessAlive(pid);
-}
-
-async function requestGracefulProxyStop(port: number, hostname: string | undefined, force: boolean): Promise<{ ok: boolean; busy: boolean; message: string }> {
-  const url = `http://${healthHost(hostname)}:${port}/api/stop${force ? "?force=1" : ""}`;
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      signal: AbortSignal.timeout(1_500),
-    });
-    const body = await response.json().catch(() => ({})) as { message?: unknown; activeTurns?: unknown; error?: unknown };
-    const active = typeof body.activeTurns === "number" ? ` (${body.activeTurns} active turn(s))` : "";
-    return {
-      ok: response.ok,
-      busy: response.status === 409 || body.error === "proxy_busy",
-      message: typeof body.message === "string" ? body.message : `${response.status} ${response.statusText}${active}`,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      busy: false,
-      message: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-async function waitForProxyDown(port: number, timeoutMs = 5_000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!await proxyHealthy(port)) return true;
-    await new Promise(resolve => setTimeout(resolve, 150));
-  }
-  return !await proxyHealthy(port);
-}
-
-async function handleStop() {
-  const force = hasFlag("--force", "-f");
-  const config = loadConfig();
-  const port = config.port ?? 10100;
-  const stopPid = readPid();
-
-  if (await proxyHealthy(port)) {
-    const stop = await requestGracefulProxyStop(port, config.hostname, force);
-    if (stop.busy) {
-      console.error(`Proxy has active work: ${stop.message}`);
-      console.error("Proxy left running so the active Codex turn is not interrupted.");
-      process.exit(1);
-    }
-    if (stop.ok) {
-      const stoppedService = stopServiceIfInstalled();
-      if (stoppedService) console.log("Service manager stopped (won't respawn).");
-      if (await waitForProxyDown(port)) {
-        if (stopPid) removePid(stopPid);
-        console.log("Proxy stopped gracefully.");
-        return;
-      }
-      if (!force) {
-        console.error("Graceful stop was accepted but the proxy is still reachable; not forcing shutdown.");
-        process.exit(1);
-      }
-    } else if (!force) {
-      const r = restoreNativeCodex();
-      console.log(r.message);
-      console.error(`Could not request graceful proxy stop: ${stop.message}`);
-      console.error("Proxy left running to avoid interrupting in-flight work. Use 'ocx stop --force' to abort it.");
-      process.exit(1);
-    }
-  }
-
-  if (!force && stopPid && isProcessAlive(stopPid)) {
-    const r = restoreNativeCodex();
-    console.log(r.message);
-    console.error(`Proxy health is unreachable but PID ${stopPid} is still alive; not force-killing it during possible work.`);
-    console.error("Use 'ocx stop --force' only when you want to abort any in-flight turn.");
-    process.exit(1);
-  }
+function handleStop() {
   const stoppedService = stopServiceIfInstalled();
   if (stoppedService) console.log("🛑 Service manager stopped (won't respawn).");
 
@@ -392,6 +250,7 @@ async function handleStop() {
       killProxy(pid);
       console.log(`✅ Proxy (PID ${pid}) stopped.`);
       removePid(pid);
+      removeRuntimePort(pid);
     } catch {
       stopFailed = true;
       console.error(`❌ Failed to stop proxy (PID ${pid}).`);
@@ -418,18 +277,18 @@ async function handleUninstall() {
     }
   };
 
-  runStep("service removed", () => {
-    stopServiceIfInstalled();
-    return uninstallServiceIfInstalled();
-  });
+  runStep("service stopped", () => stopServiceIfInstalled());
 
   runStep("proxy stopped", () => {
     const pid = readPid();
     if (!pid) return false;
     killProxy(pid);
     removePid(pid);
+    removeRuntimePort(pid);
     return true;
   });
+
+  runStep("service removed", () => uninstallServiceIfInstalled());
 
   runStep("native Codex restored", () => {
     const r = restoreNativeCodex();
@@ -445,9 +304,13 @@ async function handleUninstall() {
     console.error(`⚠️  Codex autostart shim removed failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  runStep("opencodex config removed", () => {
-    rmSync(getConfigDir(), { recursive: true, force: true });
-  });
+  if (failures.length === 0) {
+    runStep("opencodex config removed", () => {
+      rmSync(getConfigDir(), { recursive: true, force: true });
+    });
+  } else {
+    console.error("Leaving opencodex config/backups in place so the failed restore step can be retried.");
+  }
 
   if (failures.length > 0) {
     console.error(`\nUninstall finished with ${failures.length} failed step(s): ${failures.join(", ")}`);
@@ -456,56 +319,42 @@ async function handleUninstall() {
   console.log("\n✅ opencodex local state removed. Remove the package with: npm uninstall -g @bitkyc08/opencodex");
 }
 
-type HealthCheck = {
-  ok: boolean;
-  label: string;
-};
-
-async function checkProxyHealth(port: number, hostname?: string): Promise<HealthCheck> {
-  const url = `http://${healthHost(hostname)}:${port}/healthz`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 800);
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    if (!response.ok) return { ok: false, label: `${url} returned HTTP ${response.status}` };
-    const body = await response.json().catch(() => null) as { version?: unknown; uptime?: unknown } | null;
-    const version = typeof body?.version === "string" ? ` v${body.version}` : "";
-    const uptime = typeof body?.uptime === "number" ? `, uptime ${Math.round(body.uptime)}s` : "";
-    return { ok: true, label: `${url} ok${version}${uptime}` };
-  } catch (error) {
-    const reason = error instanceof Error && error.name === "AbortError" ? "timed out" : "unreachable";
-    return { ok: false, label: `${url} ${reason}` };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function handleStatus() {
-  const config = loadConfig();
-  const port = config.port ?? 10100;
-  const pid = readPid();
-  const health = await checkProxyHealth(port, config.hostname);
-  const proxyLabel = pid && health.ok
-    ? `running (PID ${pid})`
-    : pid
-      ? `PID file points to PID ${pid}, but health check failed`
-      : health.ok
-        ? "reachable, but PID file is missing or stale"
-        : "not running";
-
-  if (pid || health.ok) {
-    console.log(`✅ Proxy: ${proxyLabel}`);
-  } else {
-    console.log(`❌ Proxy: ${proxyLabel}`);
+  const statusArgs = args.slice(1);
+  const wantsJson = statusArgs.length === 1 && statusArgs[0] === "--json";
+  if (statusArgs.length > 1 || (statusArgs.length === 1 && !wantsJson)) {
+    console.error("Usage: ocx status [--json]");
+    process.exit(1);
   }
-  console.log(`   Health: ${health.label}`);
-  console.log(`   Dashboard: http://localhost:${port}/`);
-  console.log(`   Config: ${getConfigPath()}`);
-  console.log(`   Default provider: ${config.defaultProvider}`);
-  console.log(`   Codex autostart: ${codexAutoStartEnabled(config) ? "enabled" : "disabled"}`);
-  console.log(`   Service: ${serviceStatusSummary()}`);
-  const { codexShimStatus } = await import("./codex-shim");
-  console.log(`   ${codexShimStatus()}`);
+
+  const status = await collectStatus();
+  if (wantsJson) {
+    console.log(JSON.stringify(status.json, null, 2));
+    return;
+  }
+
+  if (status.json.proxy.pid || status.json.proxy.health.ok) {
+    console.log(`✅ Proxy: ${status.proxyLabel}`);
+  } else {
+    console.log(`❌ Proxy: ${status.proxyLabel}`);
+  }
+  console.log(`   Health: ${status.healthLabel}`);
+  console.log(`   Dashboard: ${status.json.dashboard.url}`);
+  console.log(`   Config: ${status.json.paths.config}`);
+  console.log(`   PID file: ${status.json.paths.pid}`);
+  console.log(`   Runtime: ${status.json.paths.runtime}`);
+  console.log(`   Runtime source: ${status.json.runtime.source}${status.json.runtime.overrideEnv ? ` (${status.json.runtime.overrideEnv})` : ""}`);
+  console.log(`   Default provider: ${status.json.defaultProvider}`);
+  console.log(`   Codex autostart: ${status.json.codexAutostart ? "enabled" : "disabled"}`);
+  console.log(`   Service: ${status.json.service.summary}`);
+  console.log(`   ${status.json.codexShim.summary}`);
+  if (status.json.codexPlugins.applicable) {
+    const icon = status.json.codexPlugins.stale ? "⚠️ " : "✅";
+    console.log(`   ${icon} Codex bundled plugins: ${status.json.codexPlugins.summary}`);
+    if (status.json.codexPlugins.suggestedRepair) {
+      console.log(`      Suggested: ${status.json.codexPlugins.suggestedRepair}`);
+    }
+  }
 }
 
 function handleRecoverHistory() {
@@ -528,7 +377,7 @@ switch (command) {
     await handleStart();
     break;
   case "stop":
-    await handleStop();
+    handleStop();
     break;
   case "restore":
   case "eject": {
@@ -574,17 +423,22 @@ switch (command) {
   case "gui": {
     const cfg = await import("./config");
     const config = cfg.loadConfig();
-    const guiUrl = `http://localhost:${config.port}`;
-    if (!cfg.readPid()) {
+    let pid = cfg.readPid();
+    if (!pid) {
       console.log("Proxy not running. Starting...");
       const child = spawn(process.execPath, [process.argv[1], "start"], {
         detached: true,
         stdio: "ignore",
+        windowsHide: true,
         env: process.env,
       });
       child.unref();
       await new Promise(r => setTimeout(r, 1000));
+      pid = cfg.readPid();
     }
+    const runtimePort = pid ? cfg.readRuntimePort(pid) : null;
+    const guiPort = runtimePort?.port ?? config.port;
+    const guiUrl = `http://localhost:${guiPort}`;
     console.log(`Opening ${guiUrl}`);
     const { openUrl } = await import("./open-url");
     openUrl(guiUrl);
@@ -611,7 +465,61 @@ switch (command) {
         break;
       }
       default:
-        console.error("Usage: ocx codex-shim <install|status|uninstall>");
+        console.error("Usage: ocx codex-shim <install|status|uninstall|remove>");
+        process.exit(1);
+    }
+    break;
+  }
+  case "codex-plugins": {
+    const wantsJson = args.includes("--json");
+    const enableCommon = args.includes("--enable-common");
+    const invalidFlags = args.slice(2).filter(arg => arg !== "--json" && arg !== "--enable-common");
+    if (invalidFlags.length > 0) {
+      console.error("Usage: ocx codex-plugins <status|repair> [--json] [--enable-common]");
+      process.exit(1);
+    }
+
+    const { diagnoseCodexBundledPlugins, repairCodexBundledPlugins } = await import("./codex-plugins-doctor");
+    switch (args[1]) {
+      case "status": {
+        const diagnostic = diagnoseCodexBundledPlugins();
+        if (wantsJson) {
+          console.log(JSON.stringify(diagnostic, null, 2));
+          break;
+        }
+        console.log(`Codex bundled plugins: ${diagnostic.summary}`);
+        if (diagnostic.applicable) {
+          if (diagnostic.marketplace.currentBundledPath) console.log(`Current bundled path: ${diagnostic.marketplace.currentBundledPath}`);
+          if (diagnostic.marketplace.source) console.log(`Configured source: ${diagnostic.marketplace.source}`);
+          for (const plugin of diagnostic.bundledPlugins) {
+            console.log(`- ${plugin.id}: ${plugin.configured ? "configured" : "not configured"}`);
+          }
+          if (diagnostic.suggestedRepair) console.log(`Suggested: ocx codex-plugins repair`);
+        }
+        break;
+      }
+      case "repair": {
+        const result = repairCodexBundledPlugins({ enableCommonPlugins: enableCommon });
+        if (wantsJson) {
+          console.log(JSON.stringify(result, null, 2));
+          if (!result.ok) process.exit(1);
+          break;
+        }
+        console.log(result.message);
+        if (result.ok) {
+          console.log(result.changed ? "Codex config updated." : "No config change needed.");
+          if (enableCommon) {
+            console.log(result.enabledPlugins.length > 0
+              ? `Enabled bundled plugins: ${result.enabledPlugins.join(", ")}`
+              : "Bundled plugin tables were already enabled.");
+          }
+        } else {
+          process.exit(1);
+        }
+        break;
+      }
+      default:
+        console.error("Usage: ocx codex-plugins <status|repair> [--json] [--enable-common]");
         process.exit(1);
     }
     break;
@@ -619,6 +527,14 @@ switch (command) {
   case "update": {
     const { runUpdate } = await import("./update");
     await runUpdate();
+    break;
+  }
+  case "__refresh-version": {
+    // Hidden, detached helper spawned by the update prompt to refresh the
+    // cached latest version without blocking the foreground start. Not in help.
+    const { refreshVersionCache } = await import("./update-notify");
+    const channel = args[1] === "preview" ? "preview" : "latest";
+    await refreshVersionCache(channel);
     break;
   }
   case "help":

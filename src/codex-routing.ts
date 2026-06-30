@@ -4,6 +4,7 @@ import { codexAccountLogLabel } from "./codex-account-label";
 import { isCodexAccountUsable } from "./codex-account-usability";
 import { isAccountNeedsReauth, markAccountNeedsReauth } from "./codex-account-runtime-state";
 import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota } from "./codex-quota";
+import { MAIN_CODEX_ACCOUNT_ID, getMainAccountPlan } from "./codex-main-account";
 import type { OcxConfig } from "./types";
 
 type ThreadAffinityEntry = {
@@ -43,6 +44,7 @@ export type CodexUpstreamOutcomeMeta = {
 };
 
 function hasConfiguredPoolAccount(config: OcxConfig, accountId: string): boolean {
+  if (accountId === MAIN_CODEX_ACCOUNT_ID) return isCodexAccountUsable(config, accountId);
   return (config.codexAccounts ?? []).some(account => !account.isMain && account.id === accountId);
 }
 
@@ -74,8 +76,14 @@ export function computeCodexUsageScore(quota: {
   weeklyPercent?: number;
   fiveHourPercent?: number;
   monthlyPercent?: number;
-} | null): number {
+} | null, plan?: string | null): number {
   if (!quota) return CODEX_UNKNOWN_USAGE_SCORE;
+  const normalizedPlan = plan?.trim().toLowerCase();
+  if (normalizedPlan === "go" || normalizedPlan === "free") {
+    return typeof quota.monthlyPercent === "number" && Number.isFinite(quota.monthlyPercent)
+      ? quota.monthlyPercent
+      : CODEX_UNKNOWN_USAGE_SCORE;
+  }
   const values = [quota.weeklyPercent, quota.fiveHourPercent, quota.monthlyPercent]
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   return values.length > 0 ? Math.max(...values) : CODEX_UNKNOWN_USAGE_SCORE;
@@ -197,18 +205,34 @@ function bindThreadAffinity(threadId: string, accountId: string, now: number): v
 }
 
 function getEligiblePoolAccounts(config: OcxConfig, excludeId?: string, now = Date.now()): string[] {
-  return (config.codexAccounts ?? [])
+  const ids = (config.codexAccounts ?? [])
     .filter(account => !account.isMain && account.id !== excludeId && !isAccountNeedsReauth(account.id))
     .filter(account => !isCodexAccountInCooldown(account.id, now))
     .filter(account => isCodexAccountUsable(config, account.id))
     .map(account => account.id);
+  // The main Codex account is not stored in config.codexAccounts; include it as a
+  // first-class rotation candidate when its read-only token is usable (Option A).
+  if (
+    excludeId !== MAIN_CODEX_ACCOUNT_ID
+    && !isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)
+    && !isCodexAccountInCooldown(MAIN_CODEX_ACCOUNT_ID, now)
+    && isCodexAccountUsable(config, MAIN_CODEX_ACCOUNT_ID)
+  ) {
+    ids.unshift(MAIN_CODEX_ACCOUNT_ID);
+  }
+  return ids;
+}
+
+function getPoolAccountPlan(config: OcxConfig, accountId: string): string | undefined {
+  if (accountId === MAIN_CODEX_ACCOUNT_ID) return getMainAccountPlan();
+  return (config.codexAccounts ?? []).find(account => !account.isMain && account.id === accountId)?.plan;
 }
 
 function pickLowerUsageAccount(config: OcxConfig, active: string, activeUsage: number, now: number): string {
   let best = active;
   let bestUsage = activeUsage;
   for (const id of getEligiblePoolAccounts(config, active, now)) {
-    const usage = computeCodexUsageScore(getAccountQuota(id));
+    const usage = computeCodexUsageScore(getAccountQuota(id), getPoolAccountPlan(config, id));
     if (usage < bestUsage) {
       best = id;
       bestUsage = usage;
@@ -221,7 +245,7 @@ export function pickLowestUsageCodexAccount(config: OcxConfig, excludeId?: strin
   let best: string | null = null;
   let bestUsage = Number.POSITIVE_INFINITY;
   for (const id of getEligiblePoolAccounts(config, excludeId, now)) {
-    const usage = computeCodexUsageScore(getAccountQuota(id));
+    const usage = computeCodexUsageScore(getAccountQuota(id), getPoolAccountPlan(config, id));
     if (usage < bestUsage) {
       best = id;
       bestUsage = usage;
@@ -240,7 +264,7 @@ function applyQuotaAutoSwitch(config: OcxConfig, active: string, now: number): s
   const threshold = config.autoSwitchThreshold ?? 80;
   if (threshold <= 0) return active;
   const quota = getAccountQuota(active);
-  const activeUsage = computeCodexUsageScore(quota);
+  const activeUsage = computeCodexUsageScore(quota, getPoolAccountPlan(config, active));
   if (activeUsage < threshold) return active;
   const best = pickLowerUsageAccount(config, active, activeUsage, now);
   if (best !== active) setActiveCodexAccount(config, best);
@@ -377,6 +401,10 @@ export function recordCodexUpstreamOutcome(
 
 export function formatCodexProviderForLog(providerName: string, accountId: string | null, config: OcxConfig): string {
   if (!accountId) return providerName;
+  // The main Codex login participates in rotation as "main-pool" (MAIN_CODEX_ACCOUNT_ID) but is the
+  // same physical account as the "main" passthrough (null accountId). Log both under the base provider
+  // name so usage/tokens aggregate into a single row instead of splitting into `chatgpt` + `chatgpt-main`.
+  if (accountId === MAIN_CODEX_ACCOUNT_ID) return providerName;
   const account = (config.codexAccounts ?? []).find(a => !a.isMain && a.id === accountId);
   return account ? `${providerName}-${codexAccountLogLabel(account)}` : providerName;
 }

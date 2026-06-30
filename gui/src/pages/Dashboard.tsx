@@ -1,23 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
+import { formatUptime } from "../formatUptime";
 import { IconAlert } from "../icons";
-import { useT, Trans } from "../i18n";
+import { useI18n, Trans } from "../i18n";
 
 interface HealthData { status: string; version: string; uptime: number }
 interface ProviderInfo { name: string; adapter: string; baseUrl: string; defaultModel?: string; hasApiKey: boolean }
 interface ModelInfo { id: string; provider: string; owned_by?: string }
 interface SettingsData { codexAutoStart: boolean; port: number; hostname: string }
 interface SidecarData { webSearch: { model: string; reasoning: string }; vision: { model: string } }
+interface UsageSummary30d { summary: { requests: number; totalTokens: number; coverageRatio: number } }
+
+function formatTokens(n: number): string {
+  if (n < 10_000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
 
 const SIDECAR_MODELS = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5", "gpt-5.3-codex-spark"];
 const REASONING_LEVELS = ["low", "medium", "high"];
 
 export default function Dashboard({ apiBase }: { apiBase: string }) {
-  const t = useT();
+  const { locale, t } = useI18n();
   const [health, setHealth] = useState<HealthData | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [sidecar, setSidecar] = useState<SidecarData | null>(null);
+  const [usage30d, setUsage30d] = useState<UsageSummary30d | null>(null);
   const [sidecarSaving, setSidecarSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -26,16 +35,18 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [hRes, pRes, sRes, scRes] = await Promise.all([
+        const [hRes, pRes, sRes, scRes, uRes] = await Promise.all([
           fetch(`${apiBase}/healthz`),
           fetch(`${apiBase}/api/providers`),
           fetch(`${apiBase}/api/settings`),
           fetch(`${apiBase}/api/sidecar-settings`),
+          fetch(`${apiBase}/api/usage?range=30d`),
         ]);
         setHealth(await hRes.json());
         setProviders(await pRes.json());
         setSettings(await sRes.json());
         setSidecar(await scRes.json());
+        try { setUsage30d(uRes.ok ? await uRes.json() : null); } catch { setUsage30d(null); }
         setError(false);
       } catch {
         setError(true);
@@ -133,8 +144,17 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
           </div>
         </div>
         <div className="stat"><div className="label">{t("dash.version")}</div><div className="value mono">{health?.version ?? "—"}</div></div>
-        <div className="stat"><div className="label">{t("dash.uptime")}</div><div className="value mono">{health ? `${Math.floor(health.uptime)}s` : "—"}</div></div>
+        <div className="stat"><div className="label">{t("dash.uptime")}</div><div className="value mono">{health ? formatUptime(health.uptime, locale) : "—"}</div></div>
         <div className="stat"><div className="label">{t("dash.providers")}</div><div className="value">{providers.length}</div></div>
+        <div className="stat">
+          <div className="label">{t("dash.tokens30d")}</div>
+          <div className="value mono">{usage30d && usage30d.summary.requests > 0 ? formatTokens(usage30d.summary.totalTokens) : "—"}</div>
+          {usage30d && usage30d.summary.requests > 0 && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
+              {t("dash.coverage").replace("{pct}", `${Math.round(usage30d.summary.coverageRatio * 100)}%`)}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="panel" style={{ marginBottom: 24 }}>
@@ -162,11 +182,23 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
             <div className="muted" style={{ fontSize: 13, marginTop: 3 }}>{t("dash.searchModelHint")}</div>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            <select className="select-sm" value={sidecar?.webSearch.model ?? "gpt-5.4-mini"} disabled={!sidecar || sidecarSaving}
+            <select
+              id="sidecar-web-search-model"
+              name="sidecarWebSearchModel"
+              className="select-sm"
+              aria-label={t("dash.searchModel")}
+              value={sidecar?.webSearch.model ?? "gpt-5.4-mini"}
+              disabled={!sidecar || sidecarSaving}
               onChange={e => saveSidecar({ webSearch: { model: e.target.value, reasoning: sidecar!.webSearch.reasoning } })}>
               {SIDECAR_MODELS.map(m => <option key={m} value={m}>{m}</option>)}
             </select>
-            <select className="select-sm" value={sidecar?.webSearch.reasoning ?? "low"} disabled={!sidecar || sidecarSaving}
+            <select
+              id="sidecar-web-search-reasoning"
+              name="sidecarWebSearchReasoning"
+              className="select-sm"
+              aria-label={`${t("dash.searchModel")} reasoning`}
+              value={sidecar?.webSearch.reasoning ?? "low"}
+              disabled={!sidecar || sidecarSaving}
               onChange={e => saveSidecar({ webSearch: { model: sidecar!.webSearch.model, reasoning: e.target.value } })}>
               {REASONING_LEVELS.map(r => <option key={r} value={r}>{r}</option>)}
             </select>
@@ -180,7 +212,13 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
             <div style={{ fontWeight: 650 }}>{t("dash.visionModel")}</div>
             <div className="muted" style={{ fontSize: 13, marginTop: 3 }}>{t("dash.visionModelHint")}</div>
           </div>
-          <select className="select-sm" value={sidecar?.vision.model ?? "gpt-5.4-mini"} disabled={!sidecar || sidecarSaving}
+          <select
+            id="sidecar-vision-model"
+            name="sidecarVisionModel"
+            className="select-sm"
+            aria-label={t("dash.visionModel")}
+            value={sidecar?.vision.model ?? "gpt-5.4-mini"}
+            disabled={!sidecar || sidecarSaving}
             onChange={e => saveSidecar({ vision: { model: e.target.value } })}>
             {SIDECAR_MODELS.map(m => <option key={m} value={m}>{m}</option>)}
           </select>

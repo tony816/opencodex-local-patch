@@ -123,6 +123,20 @@ export function namespacedToolName(namespace: string | undefined, name: string):
   return namespace ? `${namespace}__${name}` : name;
 }
 
+export function toolChoiceAliases(tool: Pick<OcxTool, "namespace" | "name">): string[] {
+  const wireName = namespacedToolName(tool.namespace, tool.name);
+  return tool.namespace ? [wireName, `${tool.namespace}.${tool.name}`] : [wireName];
+}
+
+export function toolAllowedByChoice(tool: Pick<OcxTool, "namespace" | "name">, allowedTools: ReadonlySet<string>): boolean {
+  return toolChoiceAliases(tool).some(name => allowedTools.has(name));
+}
+
+export function resolveToolChoiceWireName(tools: readonly Pick<OcxTool, "namespace" | "name">[] | undefined, name: string): string {
+  const match = tools?.find(tool => toolChoiceAliases(tool).includes(name));
+  return match ? namespacedToolName(match.namespace, match.name) : name;
+}
+
 /**
  * Whether `modelId` is in a per-provider classification list (e.g. `noVisionModels`). Matches the full
  * id, OR — for Ollama-style ids — the family before the ":size" tag, so a `gpt-oss` entry covers
@@ -135,12 +149,23 @@ export function modelInList(list: string[] | undefined, modelId: string): boolea
   return colon > 0 && list.includes(modelId.slice(0, colon));
 }
 
+export type OcxToolChoice =
+  | "auto"
+  | "none"
+  | "required"
+  | { name: string }
+  | { allowedTools: string[]; mode: "auto" | "required" };
+
+export function isAllowedToolChoice(value: OcxToolChoice | undefined): value is { allowedTools: string[]; mode: "auto" | "required" } {
+  return typeof value === "object" && value !== null && "allowedTools" in value;
+}
+
 export interface OcxRequestOptions {
   maxOutputTokens?: number;
   temperature?: number;
   topP?: number;
   stopSequences?: string[];
-  toolChoice?: "auto" | "none" | "required" | { name: string };
+  toolChoice?: OcxToolChoice;
   reasoning?: string;
   hideThinkingSummary?: boolean;
   serviceTier?: string;
@@ -150,6 +175,7 @@ export interface OcxRequestOptions {
 }
 
 export type AdapterEvent =
+  | { type: "heartbeat" }
   | { type: "text_delta"; text: string }
   | { type: "thinking_delta"; thinking: string }
   | { type: "reasoning_raw_delta"; text: string }
@@ -162,8 +188,10 @@ export type AdapterEvent =
 export interface OcxUsage {
   inputTokens: number;
   outputTokens: number;
+  totalTokens?: number;
   cachedInputTokens?: number;
   reasoningOutputTokens?: number;
+  estimated?: boolean;
 }
 
 export interface OcxConfig {
@@ -177,6 +205,10 @@ export interface OcxConfig {
   subagentModels?: string[];
   /** Routed model ids ("<provider>/<model>") hidden from Codex (excluded from the catalog + /v1/models). */
   disabledModels?: string[];
+  /** Provider-level Codex-visible context caps. Values only lower known model context windows. */
+  providerContextCaps?: Record<string, number>;
+  /** Global Codex-visible context cap value (tokens). Falls back to DEFAULT_PROVIDER_CONTEXT_CAP. */
+  contextCapValue?: number;
   /** Bind hostname. Default "127.0.0.1" (loopback only). Set "0.0.0.0" to expose on all interfaces. */
   hostname?: string;
   /** Upstream stall timeout (seconds). After this many seconds of no upstream data, emits response.incomplete. Default 90. Min 1. */
@@ -237,6 +269,8 @@ export interface OcxWebSearchSidecarConfig {
 export interface OcxProviderConfig {
   adapter: string;
   baseUrl: string;
+  /** Keep provider settings on disk but exclude it from routing and model/catalog listings. */
+  disabled?: boolean;
   apiKey?: string;
   defaultModel?: string;
   models?: string[];
@@ -294,6 +328,16 @@ export interface OcxProviderConfig {
    * attached images are described by a gpt vision model and replaced with text before the call.
    */
   noVisionModels?: string[];
+  /**
+   * Google adapter mode. "ai-studio" (default) = Generative Language API + x-goog-api-key.
+   * "vertex" = Vertex AI project/location endpoints with GCP ADC (or x-goog-api-key).
+   * "cloud-code-assist" = Google Antigravity (Cloud Code Assist) OAuth + CCA envelope.
+   */
+  googleMode?: "ai-studio" | "vertex" | "cloud-code-assist";
+  /** Vertex AI GCP project id (or GOOGLE_CLOUD_PROJECT / GCLOUD_PROJECT env). */
+  project?: string;
+  /** Vertex AI location, e.g. "us-central1" or "global" (or GOOGLE_CLOUD_LOCATION env). */
+  location?: string;
 }
 
 export interface CodexAccount {

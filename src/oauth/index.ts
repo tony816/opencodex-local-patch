@@ -6,10 +6,13 @@ import { getCredential, saveCredential } from "./store";
 import { loginXai, refreshXaiToken } from "./xai";
 import { ANTHROPIC_OAUTH_BETA, loginAnthropic, refreshAnthropicToken } from "./anthropic";
 import { loginKimi, refreshKimiToken } from "./kimi";
+import { loginKiro, readKiroCliSqlite, refreshKiroToken } from "./kiro";
 import { loginChatGPT, refreshChatGPTToken } from "./chatgpt";
+import { loginAntigravity, refreshAntigravityToken } from "./google-antigravity";
 import { deriveOAuthDefaultModel, deriveOAuthProviderConfig } from "../providers/derive";
 
 const REFRESH_SKEW_MS = 60_000;
+const tokenRefreshes = new Map<string, Promise<string>>();
 
 export interface LoginOpts { forceLogin?: boolean }
 
@@ -52,6 +55,18 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {
     providerConfig: oauthConfig("kimi"),
     defaultModel: oauthDefaultModel("kimi"),
   },
+  kiro: {
+    login: (ctrl) => loginKiro(ctrl),
+    refresh: (rt, signal) => refreshKiroToken(rt, signal),
+    providerConfig: oauthConfig("kiro"),
+    defaultModel: oauthDefaultModel("kiro"),
+  },
+  "google-antigravity": {
+    login: (ctrl) => loginAntigravity(ctrl),
+    refresh: refreshAntigravityToken,
+    providerConfig: oauthConfig("google-antigravity"),
+    defaultModel: oauthDefaultModel("google-antigravity"),
+  },
   chatgpt: {
     login: loginChatGPT,
     refresh: (rt) => refreshChatGPTToken(rt),
@@ -64,21 +79,84 @@ export function isOAuthProvider(name: string): boolean {
   return name in OAUTH_PROVIDERS;
 }
 
+/** The discovered project id stored on an OAuth credential (Antigravity CCA), if any. */
+export function getOAuthCredentialProjectId(provider: string): string | undefined {
+  return getCredential(provider)?.projectId;
+}
+
 /** Provider ids that support real OAuth login (drives the GUI's "Log in with …" buttons). */
 export function listOAuthProviders(): string[] {
   return Object.keys(OAUTH_PROVIDERS);
 }
 
+export class UnsupportedOAuthProviderError extends Error {
+  constructor(provider: string) {
+    super(`Unsupported OAuth provider in config: ${provider}`);
+    this.name = "UnsupportedOAuthProviderError";
+  }
+}
+
+export class OAuthLoginRequiredError extends Error {
+  constructor(provider: string) {
+    super(`Not logged in to ${provider}. Run: ocx login ${provider}`);
+    this.name = "OAuthLoginRequiredError";
+  }
+}
+
 /** Return a valid access token, refreshing + persisting if expired. Throws if not logged in. */
 export async function getValidAccessToken(provider: string): Promise<string> {
   const def = OAUTH_PROVIDERS[provider];
-  if (!def) throw new Error(`Unknown OAuth provider: ${provider}`);
+  if (!def) throw new UnsupportedOAuthProviderError(provider);
   const cred = getCredential(provider);
-  if (!cred) throw new Error(`Not logged in to ${provider}. Run: ocx login ${provider}`);
+  if (!cred) throw new OAuthLoginRequiredError(provider);
   if (cred.expires > Date.now() + REFRESH_SKEW_MS) return cred.access;
-  const fresh = await def.refresh(cred.refresh);
-  saveCredential(provider, fresh);
-  return fresh.access;
+  const existing = tokenRefreshes.get(provider);
+  if (existing) return existing;
+  const refresh = refreshAndPersistAccessToken(provider, def, cred).finally(() => {
+    if (tokenRefreshes.get(provider) === refresh) tokenRefreshes.delete(provider);
+  });
+  tokenRefreshes.set(provider, refresh);
+  return refresh;
+}
+
+function readFreshKiroCliCredential(): OAuthCredentials | undefined {
+  const imported = readKiroCliSqlite();
+  if (!imported || imported.expires <= Date.now() + REFRESH_SKEW_MS) return undefined;
+  return { access: imported.access, refresh: imported.refresh, expires: imported.expires, source: "local-cli" };
+}
+
+async function refreshAndPersistAccessToken(
+  provider: string,
+  def: OAuthProviderDef,
+  cred: OAuthCredentials,
+): Promise<string> {
+  if (provider === "kiro") {
+    const imported = readFreshKiroCliCredential();
+    if (imported) {
+      saveCredential(provider, imported);
+      return imported.access;
+    }
+  }
+  try {
+    const fresh = await def.refresh(cred.refresh);
+    saveCredential(provider, {
+      ...fresh,
+      source: fresh.source ?? cred.source ?? "oauth",
+      // Preserve a previously-discovered project id when a refresh-time re-discovery comes back empty
+      // (e.g. a transient network blip), so Antigravity does not lose its CCA project across refresh.
+      ...(fresh.projectId === undefined && cred.projectId ? { projectId: cred.projectId } : {}),
+    });
+    return fresh.access;
+  } catch (err) {
+    if (provider === "kiro") {
+      const imported = readFreshKiroCliCredential();
+      if (imported) {
+        saveCredential(provider, imported);
+        return imported.access;
+      }
+    }
+    throw err;
+  }
 }
 
 /**
@@ -190,8 +268,9 @@ export function upsertOAuthProvider(config: OcxConfig, provider: string): void {
 /** Run the login flow, persist the credential + upsert the provider entry to disk, return cred. */
 export async function runLogin(provider: string, ctrl: OAuthController, opts?: LoginOpts): Promise<OAuthCredentials> {
   const def = OAUTH_PROVIDERS[provider];
-  if (!def) throw new Error(`Unknown OAuth provider: ${provider}`);
-  const cred = await def.login(ctrl, opts);
+  if (!def) throw new UnsupportedOAuthProviderError(provider);
+  const rawCred = await def.login(ctrl, opts);
+  const cred: OAuthCredentials = rawCred.source ? rawCred : { ...rawCred, source: "oauth" };
   saveCredential(provider, cred);
   const config = loadConfig();
   upsertOAuthProvider(config, provider);
@@ -207,10 +286,10 @@ export async function runLogin(provider: string, ctrl: OAuthController, opts?: L
 const loginState = new Map<string, { error?: string; done: boolean }>();
 const loginAbort = new Map<string, AbortController>();
 
-export function getLoginStatus(provider: string): { loggedIn: boolean; email?: string; error?: string; done: boolean } {
+export function getLoginStatus(provider: string): { loggedIn: boolean; email?: string; source?: OAuthCredentials["source"]; error?: string; done: boolean } {
   const cred = getCredential(provider);
   const st = loginState.get(provider);
-  return { loggedIn: !!cred, email: maskEmail(cred?.email) ?? undefined, error: st?.error, done: st?.done ?? false };
+  return { loggedIn: !!cred, email: maskEmail(cred?.email) ?? undefined, source: cred?.source, error: st?.error, done: st?.done ?? false };
 }
 
 export function clearLoginState(provider: string): void {
@@ -231,7 +310,7 @@ export function cancelLoginFlow(provider: string): boolean {
 
 export async function startLoginFlow(provider: string, opts?: LoginOpts): Promise<{ url: string; instructions?: string }> {
   const def = OAUTH_PROVIDERS[provider];
-  if (!def) throw new Error(`Unknown OAuth provider: ${provider}`);
+  if (!def) throw new UnsupportedOAuthProviderError(provider);
   const existing = loginState.get(provider);
   if (existing && !existing.done) {
     throw new Error(`A login for ${provider} is already in progress`);

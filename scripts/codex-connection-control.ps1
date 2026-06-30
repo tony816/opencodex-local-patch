@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+$script:LastStepSucceeded = $true
 
 function Write-Title {
   Clear-Host
@@ -26,13 +27,31 @@ function Run-Step {
   Write-Host ""
   Write-Host "==> $Label" -ForegroundColor Yellow
   Write-Host "ocx $($Args -join ' ')" -ForegroundColor DarkGray
-  & ocx @Args
+
+  if ($AllowFailure) {
+    $output = & ocx @Args 2>&1
+    $code = $LASTEXITCODE
+    if ($code -eq 0 -and $null -ne $output) {
+      $output | ForEach-Object { Write-Host $_ }
+    }
+  } else {
+    & ocx @Args
+    $code = $LASTEXITCODE
+  }
+
   $code = $LASTEXITCODE
-  if ($code -ne 0 -and -not $AllowFailure) {
+  if ($code -eq 0) {
+    $script:LastStepSucceeded = $true
+    return
+  }
+  $script:LastStepSucceeded = $false
+  if (-not $AllowFailure) {
     Write-Host ""
     Write-Host "Command failed with exit code $code." -ForegroundColor Red
     throw "ocx $($Args -join ' ') failed"
   }
+  Write-Host ""
+  Write-Host "Skipped after exit code $code." -ForegroundColor DarkYellow
 }
 
 function Show-Status {
@@ -53,8 +72,15 @@ function Repair-Plugins {
 function Enable-AlwaysOn {
   Write-Title
   Repair-Plugins
-  Run-Step "Install/start background service" @("service", "install")
-  Run-Step "Start background service" @("service", "start") -AllowFailure
+  Run-Step "Install/start background service" @("service", "install") -AllowFailure
+  $serviceInstalled = $script:LastStepSucceeded
+  if ($serviceInstalled) {
+    Run-Step "Start background service" @("service", "start") -AllowFailure
+  } else {
+    Write-Host ""
+    Write-Host "Background service could not be installed with the current Windows permissions." -ForegroundColor DarkYellow
+    Write-Host "Continuing with the Codex launch shim, so OpenCodex starts when codex runs." -ForegroundColor DarkYellow
+  }
   Run-Step "Install Codex launch shim" @("codex-shim", "install")
   Run-Step "Ensure OpenCodex is active and injected" @("ensure")
   Show-Status
@@ -107,7 +133,7 @@ if ($SessionOnly) { Enable-SessionOnly; exit 0 }
 
 while ($true) {
   Write-Title
-  Write-Host "1. OpenCodex ON  - always-on service + Codex shim"
+  Write-Host "1. OpenCodex ON  - service if permitted + Codex shim"
   Write-Host "2. OpenCodex ON  - on-demand when codex starts"
   Write-Host "3. OpenCodex ON  - this session only, no shim/service"
   Write-Host "4. Original Codex ON / OpenCodex OFF"
